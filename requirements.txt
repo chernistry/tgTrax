@@ -1,0 +1,8 @@
+telethon>=1.28.5
+pandas
+numpy
+scipy
+networkx
+python-louvain>=0.16
+plotly
+python-dotenv

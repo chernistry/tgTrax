@@ -8,11 +8,9 @@
 import asyncio
 import datetime
 import os
-import time # For sleep in main loop
 from typing import List, Dict, Optional, Any, Union, TypeAlias
 
 import pandas as pd
-from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
 from telethon.tl.types import (
     User,
@@ -24,6 +22,7 @@ from telethon.tl.types import (
 )
 
 from tgTrax.core.database import SQLiteDatabase
+from tgTrax.core import settings
 from tgTrax.utils import tui
 from tgTrax.utils.logger_adapter import TuiLoggerAdapter
 
@@ -36,52 +35,25 @@ from tgTrax.utils.logger_adapter import TuiLoggerAdapter
 # --- Constants & Global Configuration ---
 logger = TuiLoggerAdapter(tui) # Global logger instance
 
-load_dotenv() # Load environment variables from .env file
+# Import configuration from centralized settings
+TELEGRAM_API_ID = settings.TELEGRAM_API_ID
+TELEGRAM_API_HASH = settings.TELEGRAM_API_HASH
+PROJECT_ROOT = settings.PROJECT_ROOT
+SESSIONS_DIR = settings.SESSIONS_DIR
+SESSION_NAME_DEFAULT = settings.DEFAULT_SESSION_NAME
+USER_STATUS_POLL_INTERVAL_SECONDS = settings.USER_STATUS_POLL_INTERVAL_SECONDS
+MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS = settings.MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS
+TARGET_DEBUG_USERS = settings.TARGET_DEBUG_USERS
 
-# Telegram API Credentials (from .env)
-TELEGRAM_API_ID_STR: Optional[str] = os.getenv("TELEGRAM_API_ID")
-TELEGRAM_API_HASH: Optional[str] = os.getenv("TELEGRAM_API_HASH")
-TELEGRAM_API_ID: Optional[int] = None
-
-if not TELEGRAM_API_ID_STR or not TELEGRAM_API_HASH:
+# Validate critical settings
+if not settings.TELEGRAM_API_ID_STR or not TELEGRAM_API_HASH:
     logger.error(
         "Critical: TELEGRAM_API_ID or TELEGRAM_API_HASH not found in .env or environment."
     )
     # Application might fail later if these are strictly required by TelegramClient
-else:
-    try:
-        TELEGRAM_API_ID = int(TELEGRAM_API_ID_STR)
-    except ValueError:
-        logger.error("Critical: TELEGRAM_API_ID must be an integer.")
 
-# Project paths
-# Assuming this script (tracker.py) is in tgTrax/core/
-# PROJECT_ROOT will then be tgTrax/
-PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SESSIONS_DIR: str = os.path.join(PROJECT_ROOT, "sessions")
-if not os.path.exists(SESSIONS_DIR):
-    os.makedirs(SESSIONS_DIR)
-    tui.tui_print_info(f"Created sessions directory: {SESSIONS_DIR}")
-
-SESSION_NAME_DEFAULT: str = os.path.join(SESSIONS_DIR, "correlation_tracker_session")
-
-# Polling and activity configuration (from .env, with defaults)
-USER_STATUS_POLL_INTERVAL_SECONDS: int = int(
-    os.getenv("USER_STATUS_POLL_INTERVAL_SECONDS", "60")
-)
-MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS: int = int(
-    os.getenv("MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS", "60")
-)
-
-# Debugging: List of usernames for verbose status logging
-TARGET_DEBUG_USERS: List[str] = [
-    "metal_vuf",
-    "MityaMetelitsa",
-    "kochanovigor",
-    "denis_ratnikov",
-    "FominaVictoria",
-    "sasha_lovelle",
-]
+if TELEGRAM_API_ID is None and settings.TELEGRAM_API_ID_STR:
+    logger.error("Critical: TELEGRAM_API_ID must be an integer.")
 
 
 # --- CorrelationTracker Class ---
@@ -97,7 +69,7 @@ class CorrelationTracker:
     def __init__(
         self,
         target_usernames: List[str],
-        db_path: str = "activity.db",
+        db_path: str = settings.DEFAULT_DB_NAME,
         session_name: str = SESSION_NAME_DEFAULT,
     ) -> None:
         """
@@ -157,8 +129,8 @@ class CorrelationTracker:
             self.session_name,
             TELEGRAM_API_ID,
             TELEGRAM_API_HASH,
-            connection_retries=None,  # Retry indefinitely
-            retry_delay=5,            # Delay between retries (seconds)
+            connection_retries=settings.CLIENT_CONNECTION_RETRIES,  # Retry indefinitely
+            retry_delay=settings.CLIENT_RETRY_DELAY_SECONDS,       # Delay between retries (seconds)
         )
 
 
@@ -584,8 +556,8 @@ class CorrelationTracker:
                     logger.error(f"Polling: Unexpected error for {username}: {e_poll_user}", exc_info=True)
                 
                 # Small delay between polling individual users if many users and short interval
-                if len(self.user_id_map) > 10 and USER_STATUS_POLL_INTERVAL_SECONDS < 30:
-                     try: await asyncio.sleep(0.5)
+                if len(self.user_id_map) > settings.MAX_USERS_BEFORE_DELAY and USER_STATUS_POLL_INTERVAL_SECONDS < 30:
+                     try: await asyncio.sleep(settings.INTER_USER_POLL_DELAY_SECONDS)
                      except asyncio.CancelledError: break # Exit user loop
             
             if self.shutdown_event.is_set(): break # Exit main while loop

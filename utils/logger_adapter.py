@@ -14,7 +14,11 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 # from tgTrax.utils import tui  # Original import, might need adjustment based on project structure
 # For now, let's assume tui is available in the same package or a discoverable path.
 # If tgTrax is the root package, and utils is a subpackage:
-from .. import tui  # Example of relative import if inside a package
+try:
+    from . import tui  # Example of relative import if inside a package
+except ImportError:
+    # Fallback for different import structures
+    import tui  # type: ignore
 
 
 # --- TuiLoggerAdapter Class ---

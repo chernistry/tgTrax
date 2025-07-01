@@ -14,7 +14,8 @@ import pandas as pd
 from scipy.stats import spearmanr # Using spearmanr for correlation
 
 import community.community_louvain as community_louvain # Explicitly for clarity
-from utils import tui # For console output
+from tgTrax.utils import tui # For console output
+from tgTrax.core import settings
 
 
 # --- Constants ---
@@ -31,9 +32,9 @@ class TemporalAnalyzer:
     def __init__(
         self,
         activity_df: pd.DataFrame,
-        resample_period: str = "1min",
-        correlation_threshold: float = 0.6,
-        jaccard_threshold: float = 0.18  # New parameter matching correlation_analyzer.py
+        resample_period: str = settings.DEFAULT_RESAMPLE_PERIOD,
+        correlation_threshold: float = settings.DEFAULT_CORRELATION_THRESHOLD,
+        jaccard_threshold: float = settings.DEFAULT_JACCARD_THRESHOLD  # New parameter matching correlation_analyzer.py
     ):
         """
         Initializes the TemporalAnalyzer with activity data.

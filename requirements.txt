@@ -6,3 +6,5 @@ networkx
 python-louvain>=0.16
 plotly
 python-dotenv
+pydantic>=2.0.0
+rich>=13.0.0

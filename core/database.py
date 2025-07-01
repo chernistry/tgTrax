@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Tuple
 
 # Assuming tui is correctly importable from tgTrax.utils
 from tgTrax.utils import tui
+from tgTrax.core import settings
 
 
 # ==== SQLITE DATABASE CLASS ==== #
@@ -23,7 +24,7 @@ class SQLiteDatabase:
             or None if not connected.
     """
 
-    def __init__(self, db_path: str = "tgTrax_activity.db") -> None:
+    def __init__(self, db_path: str = settings.DEFAULT_DB_NAME) -> None:
         """Initializes the SQLiteDatabase instance and establishes a connection.
 
         Creates necessary tables if they don't already exist.
@@ -68,14 +69,14 @@ class SQLiteDatabase:
             # check_same_thread=False is convenient but requires careful management
             # if the same connection is accessed by multiple threads.
             self.connection = sqlite3.connect(
-                self.db_path, timeout=15.0, check_same_thread=False
+                self.db_path, timeout=settings.DEFAULT_DB_TIMEOUT_SECONDS, check_same_thread=False
             )
             # It's good practice to enable foreign key constraints if using them.
             # self.connection.execute("PRAGMA foreign_keys = ON")
             tui.tui_db_event(
                 "Connected",
                 "SQLite Database",
-                f"Path: {self.db_path}, Timeout: 15s",
+                f"Path: {self.db_path}, Timeout: {settings.DEFAULT_DB_TIMEOUT_SECONDS}s",
             )
         except sqlite3.Error as e:
             tui.tui_print_error(
@@ -210,9 +211,15 @@ class SQLiteDatabase:
                 f"Error fetching activity for users ({len(usernames)} users): {e}"
             )
             return []
-        except Exception as e_general: # Catch any other unexpected errors
+        except (ValueError, TypeError) as e_general: # Catch data processing errors
             tui.tui_print_error(
-                f"Unexpected error in get_all_activity_for_users: {e_general}"
+                f"Data processing error in get_all_activity_for_users: {e_general}"
+            )
+            return []
+        except Exception as e_unexpected: # Catch any other truly unexpected errors
+            tui.tui_print_error(
+                f"Unexpected error in get_all_activity_for_users: {e_unexpected}",
+                exc_info=True
             )
             return []
 

@@ -489,6 +489,7 @@ if __name__ == '__main__':
     tui_panel(error_panel_content, title="Critical Error", style="error")
 
     tui_print_info("--- Progress Bar Demo ---")
+    # TODO: Consider making this demo async if called from async context
     import time # Import time here as it's only used in demo
     TOTAL_DEMO_STEPS = 10
     with tui_progress_bar(
@@ -497,7 +498,7 @@ if __name__ == '__main__':
     ) as progress:
         task_id = progress.add_task("Downloading...", total=TOTAL_DEMO_STEPS)
         for i in range(TOTAL_DEMO_STEPS):
-            time.sleep(0.05)
+            time.sleep(0.05)  # NOTE: This is demo code - use asyncio.sleep in async contexts
             progress.update(
                 task_id,
                 advance=1,

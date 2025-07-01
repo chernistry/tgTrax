@@ -19,6 +19,7 @@ from telethon.tl.types import User # For type hinting `me`
 # Assuming tui and TuiLoggerAdapter are correctly importable from tgTrax.utils
 from tgTrax.utils import tui
 from tgTrax.utils.logger_adapter import TuiLoggerAdapter
+from tgTrax.core import settings
 
 
 # Initialize logger for this module

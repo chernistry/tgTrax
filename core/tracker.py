@@ -425,7 +425,7 @@ class CorrelationTracker:
                     f"Original assumed: {assumed_online_timestamp_ms}, final: {timestamp_ms}"
                 )
                 assumed_online_timestamp_ms = timestamp_ms - 1 
-            self.db.insert_activity(username, assumed_online_timestamp_ms, True)
+            await self._insert_activity_async(username, assumed_online_timestamp_ms, True)
             assumed_log_dt_utc = datetime.datetime.fromtimestamp(
                 assumed_online_timestamp_ms / 1000, tz=datetime.timezone.utc
             )
@@ -435,7 +435,7 @@ class CorrelationTracker:
             )
         
         # Insert the primary status record
-        self.db.insert_activity(username, timestamp_ms, is_online)
+        await self._insert_activity_async(username, timestamp_ms, is_online)
         final_record_dt_utc = datetime.datetime.fromtimestamp(timestamp_ms / 1000, tz=datetime.timezone.utc)
         tui.tui_print_debug(
             f"[{source}] DB record for {username} (ID: {user_id}): "
@@ -781,6 +781,29 @@ class CorrelationTracker:
             tui.tui_print_success("Database connection closed.")
         
         tui.tui_process_complete("Tracker shutdown sequence")
+
+
+    # TODO: Consider configuring a dedicated ThreadPoolExecutor with a sensible
+    # max_workers setting (e.g., 3–5) and reuse it across DB operations instead
+    # of relying on the default global executor.
+    async def _insert_activity_async(self, username: str, timestamp_ms: int, online: bool) -> bool:
+        """Runs the synchronous SQLite insert in a thread to avoid blocking the event loop.
+
+        Args:
+            username: Telegram username
+            timestamp_ms: Unix timestamp in milliseconds
+            online: Online status
+
+        Returns:
+            True if the insert/update succeeded, otherwise False.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            None,  # Use default executor – we rely on global limit elsewhere
+            self.db.insert_activity,
+            username,
+            timestamp_ms,
+            online,
+        )
 
 
 

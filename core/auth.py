@@ -16,9 +16,17 @@ from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, UserIsBotError
 from telethon.tl.types import User # For type hinting `me`
 
-# Assuming tui and TuiLoggerAdapter are correctly importable from tgTrax.utils
-from tgTrax.utils import tui
-from tgTrax.utils.logger_adapter import TuiLoggerAdapter
+# Import TUI modules with fallback
+try:
+    from ..utils import tui
+    from ..utils.logger_adapter import TuiLoggerAdapter
+except ImportError:
+    try:
+        from tgTrax.utils import tui
+        from tgTrax.utils.logger_adapter import TuiLoggerAdapter
+    except ImportError:
+        from utils import tui
+        from utils.logger_adapter import TuiLoggerAdapter
 
 
 # Initialize logger for this module

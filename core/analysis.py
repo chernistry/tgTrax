@@ -14,7 +14,14 @@ import pandas as pd
 from scipy.stats import spearmanr # Using spearmanr for correlation
 
 import community.community_louvain as community_louvain # Explicitly for clarity
-from utils import tui # For console output
+
+try:
+    from ..utils import tui # For console output
+except ImportError:
+    try:
+        from tgTrax.utils import tui
+    except ImportError:
+        from utils import tui
 
 
 # --- Constants ---

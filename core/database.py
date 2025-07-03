@@ -8,8 +8,14 @@ import os
 import sqlite3
 from typing import Any, List, Optional, Tuple
 
-# Assuming tui is correctly importable from tgTrax.utils
-from tgTrax.utils import tui
+# Import TUI module with fallback
+try:
+    from ..utils import tui
+except ImportError:
+    try:
+        from tgTrax.utils import tui
+    except ImportError:
+        from utils import tui
 
 
 # ==== SQLITE DATABASE CLASS ==== #

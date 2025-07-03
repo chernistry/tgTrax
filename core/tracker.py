@@ -23,9 +23,19 @@ from telethon.tl.types import (
     UserStatusLastMonth,
 )
 
-from tgTrax.core.database import SQLiteDatabase
-from tgTrax.utils import tui
-from tgTrax.utils.logger_adapter import TuiLoggerAdapter
+try:
+    from .database import SQLiteDatabase
+    from ..utils import tui
+    from ..utils.logger_adapter import TuiLoggerAdapter
+except ImportError:
+    try:
+        from tgTrax.core.database import SQLiteDatabase
+        from tgTrax.utils import tui
+        from tgTrax.utils.logger_adapter import TuiLoggerAdapter
+    except ImportError:
+        from core.database import SQLiteDatabase
+        from utils import tui
+        from utils.logger_adapter import TuiLoggerAdapter
 
 
 # --- Type Aliases ---

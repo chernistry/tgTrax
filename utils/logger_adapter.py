@@ -10,11 +10,14 @@ import logging
 import traceback # For exc_info handling
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-# Assuming tui.py provides the TUI functions, adjust if path is different
-# from tgTrax.utils import tui  # Original import, might need adjustment based on project structure
-# For now, let's assume tui is available in the same package or a discoverable path.
-# If tgTrax is the root package, and utils is a subpackage:
-from .. import tui  # Example of relative import if inside a package
+# Import tui module from the same package
+try:
+    from . import tui  # Relative import within utils package
+except ImportError:
+    try:
+        from tgTrax.utils import tui  # Absolute import
+    except ImportError:
+        import tui  # Fallback direct import
 
 
 # --- TuiLoggerAdapter Class ---

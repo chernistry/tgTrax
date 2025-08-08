@@ -1,0 +1,8 @@
+{
+    "telegram_session_name": "tgTrax_session",
+    "database_path": "tgTrax.db",
+    "log_level": "INFO",
+    "log_path": "tgTrax.log",
+    "scan_user_batch_size": 10,
+    "scan_user_delay_seconds": 5
+}

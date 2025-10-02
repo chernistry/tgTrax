@@ -1,0 +1,22 @@
+{
+    "telegram_session_name": "tgTrax_session",
+    "database_path": "tgTrax.db",
+    "log_level": "INFO",
+    "log_path": "tgTrax.log",
+    "scan_user_batch_size": 10,
+    "scan_user_delay_seconds": 5,
+    "scrape_channel_default_limit": 1000,
+    "scrape_channel_default_older_than_days": 30,
+    "dashboard_host": "0.0.0.0",
+    "dashboard_port": 8050,
+    "dashboard_debug": true,
+    "unreactor_default_action_delay_seconds": 2,
+    "unreactor_default_scan_delay_seconds": 1,
+    "unreactor_default_max_messages_per_chat_scan": 1000,
+    "unreactor_default_scan_days_ago": 90,
+    "unreactor_default_max_stories_per_peer_scan": 50,
+    "redis_host": "localhost",
+    "redis_port": 6379,
+    "redis_db": 0,
+    "redis_cache_ttl_seconds": 3600
+}

@@ -1,0 +1,35 @@
+:root {
+  --bg: #0b1220;
+  --card: #111a2b;
+  --muted: #9fb3c8;
+  --accent: #4cc9f0;
+  --ok: #16db93;
+  --warn: #f0c419;
+  --err: #ef476f;
+}
+
+html, body, #__next { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: white;
+  font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+    Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+}
+
+.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+.row { display: flex; gap: 16px; flex-wrap: wrap; }
+.card { background: var(--card); padding: 16px; border-radius: 8px; flex: 1; min-width: 260px; }
+.title { font-size: 1.5rem; margin: 0 0 12px; }
+.muted { color: var(--muted); }
+.nav { background: #0f182a; border-bottom: 1px solid #1c2a44; }
+.nav-inner { display:flex; align-items:center; justify-content: space-between; padding: 12px 24px; }
+.nav a { color: white; text-decoration: none; margin-right: 16px; }
+.nav .brand { font-weight: 700; letter-spacing: .4px; }
+.table { width: 100%; border-collapse: collapse; }
+.table th, .table td { padding: 8px 10px; border-bottom: 1px solid #1f2c47; }
+.pill { padding: 2px 8px; border-radius: 999px; font-size: .85rem; }
+.pill.ok { background: rgba(22,219,147,.2); color: var(--ok); }
+.pill.warn { background: rgba(240,196,25,.2); color: var(--warn); }
+.pill.err { background: rgba(239,71,111,.2); color: var(--err); }
+

@@ -1,0 +1,14 @@
+telethon>=1.28.5
+pandas
+numpy
+scipy
+networkx
+python-louvain>=0.16
+Flask
+flask-cors
+plotly
+python-dotenv
+statsmodels>=0.13
+rich>=13
+rumps # For macOS menu bar app 
+redis>=4.0.0 # Added for caching 

@@ -1,0 +1,42 @@
+{
+  "name": "tgtrax-webui",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:ui": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^5.4.0",
+    "ag-grid-community": "^32.2.1",
+    "ag-grid-react": "^32.2.1",
+    "antd": "^5.19.0",
+    "axios": "^1.12.2",
+    "next": "^15.0.3",
+    "plotly.js": "2.35.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-force-graph": "^1.47.3",
+    "react-force-graph-2d": "^1.25.3",
+    "react-plotly.js": "2.6.0",
+    "reagraph": "^4.30.5",
+    "swr": "2.2.5",
+    "three": "^0.160.0"
+  },
+  "resolutions": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "@react-three/fiber": "^8.15.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.6.2",
+    "@types/react": "19.0.2",
+    "@types/react-dom": "19.0.1",
+    "typescript": "5.9.3"
+  }
+}

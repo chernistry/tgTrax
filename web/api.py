@@ -9,7 +9,7 @@ import signal
 import subprocess
 import pandas as pd
 
-from tgTrax.utils import tui
+import logging
 import asyncio
 import threading
 from telethon import TelegramClient, errors as tg_errors
@@ -98,7 +98,7 @@ def _fetch_activity_df() -> pd.DataFrame:
             target_users = [r[0] for r in cur.fetchall()]
             conn.close()
         except Exception as e:
-            tui.tui_print_warning(f"API could not discover users from DB: {e}")
+            logger.warning("API could not discover users from DB: %s", e)
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
@@ -737,7 +737,7 @@ def graph_combined() -> Any:
             pos = nx.circular_layout(g)
         positions = {n: {"x": float(p[0]), "y": float(p[1])} for n, p in pos.items()}
     except Exception as e:
-        tui.tui_print_warning(f"layout compute error: {e}")
+        logger.warning("layout compute error: %s", e)
 
     nodes = [{"id": n, "community": g.nodes[n].get("community"), **(positions.get(n,{"x":0.0,"y":0.0}))} for n in g.nodes]
     edges = [{
@@ -977,7 +977,7 @@ def stack_status() -> Any:
                 os.remove(_pid_file())
                 pid = None
     except Exception as e:
-        tui.tui_print_warning(f"status check error: {e}")
+        logger.warning("status check error: %s", e)
     # include started_at if exists
     started_at = None
     try:
@@ -1017,9 +1017,9 @@ def _get_api_credentials() -> Tuple[int | None, str | None, str]:
         if os.path.exists(legacy) and not os.path.exists(f"{session_path}.session"):
             import shutil
             shutil.copy2(legacy, f"{session_path}.session")
-            tui.tui_print_info(f"Migrated legacy session to {session_path}.session")
+            logger.info("Migrated legacy session to %s.session", session_path)
     except Exception as e:
-        tui.tui_print_warning(f"Session migration skipped: {e}")
+        logger.warning("Session migration skipped: %s", e)
     return api_id, api_hash, session_path
 
 
@@ -1187,7 +1187,7 @@ def stack_start() -> Any:
             with open(_state_file(), 'w') as f:
                 json.dump({"pid": proc.pid, "started_at": dt.datetime.utcnow().isoformat() + 'Z'}, f)
         except Exception as e:
-            tui.tui_print_warning(f"state write failed: {e}")
+        logger.warning("state write failed: %s", e)
         time.sleep(0.5)
         return jsonify({"started": True, "pid": proc.pid})
     except Exception as e:
@@ -1239,3 +1239,4 @@ def stack_logs() -> Any:
         return jsonify({"log": tail})
     except Exception as e:
         return jsonify({"log": f"(error reading log: {e})"})
+logger = logging.getLogger(__name__)

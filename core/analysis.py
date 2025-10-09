@@ -1,18 +1,24 @@
 from __future__ import annotations
+
 # ==== TEMPORAL ANALYSIS MODULE ==== #
-# Description: This module provides the TemporalAnalyzer class for analyzing user activity patterns,
-#              calculating correlations, detecting communities, and generating activity summaries.
-#              It also includes a helper function to create Gantt charts for visualizing activity.
+"""
+Temporal analysis utilities for user activity data.
+
+Provides the `TemporalAnalyzer` for correlation, cross-correlation with lag
+search, community detection, and summary computations, keeping original logic
+intact. Includes helper routines for residualization and Gantt preparation.
+"""
 
 
-import datetime # Added for type hinting and usage in get_activity_intervals
+import datetime  # Added for type hinting in activity interval utilities
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple, Union, Optional # For precise type hinting
+from typing import Any, Dict, List, Tuple, Union, Optional  # Precise type hints
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr, pearsonr  # For p-values and cross-correlation
+
 try:
     from scipy.stats import t as student_t  # For fast p-values via t distribution
 except Exception:
@@ -24,13 +30,20 @@ except Exception:
 try:
     from scipy.stats import ConstantInputWarning  # type: ignore
 except Exception:
+
     class ConstantInputWarning(Warning):
         pass
+
+
 import warnings
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import shared_memory
 import threading
+
+
+# ==== CORE PROCESSING MODULE ==== #
+# --► DATA EXTRACTION & TRANSFORMATION
 
 
 def _xcorr_perm_worker_batch(
@@ -41,11 +54,19 @@ def _xcorr_perm_worker_batch(
     obs_max: np.ndarray,
     batch_shifts: np.ndarray,
 ) -> np.ndarray:
-    """Process worker: computes GE counts for a batch of circular shifts.
+    """
+    Process worker: compute greater-equal counts for a batch of circular shifts.
 
-    - arr is already ranked if Spearman is desired; otherwise raw for Pearson.
-    - obs_max is matrix of observed max |r| per pair.
-    - Returns symmetric ge_counts increment (n×n).
+    Args:
+        arr: Ranked (Spearman) or raw (Pearson) T×n matrix.
+        T: Number of timesteps.
+        n: Number of users (columns).
+        max_lag_steps: Max lag in steps for search window.
+        obs_max: Observed max |r| per pair matrix.
+        batch_shifts: Vector of circular shifts to test.
+
+    Returns:
+        np.ndarray: Symmetric GE-counts increment (n×n) for this batch.
     """
     iu_local = np.triu_indices(n, k=1)
     ge = np.zeros((n, n), dtype=float)
@@ -53,6 +74,8 @@ def _xcorr_perm_worker_batch(
         Yshift = np.roll(arr, int(s), axis=0)
         best_abs = np.full((n, n), -1.0, dtype=float)
         for k in range(-max_lag_steps, max_lag_steps + 1):
+            # k is the lag in steps. We extract overlapping windows X and Y.
+            # L is the overlap length between these windows.
             if k == 0:
                 L = T
                 X = arr
@@ -70,34 +93,42 @@ def _xcorr_perm_worker_batch(
                     continue
                 X = arr[:L, :]
                 Y = Yshift[kk:, :]
+            # Column/Pairwise compact stats for fast correlation across all pairs:
+            # - sx/sy: column sums; ssx/ssy: sum of squares; sxy: X'Y cross-products
+            # - num: covariance numerators; vx/vy: variance parts per column
             sx = X.sum(axis=0)
             sy = Y.sum(axis=0)
-            ssx = np.einsum('ij,ij->j', X, X)
-            ssy = np.einsum('ij,ij->j', Y, Y)
+            ssx = np.einsum("ij,ij->j", X, X)
+            ssy = np.einsum("ij,ij->j", Y, Y)
             sxy = X.T @ Y
             num = sxy - np.outer(sx, sy) / L
             vx = ssx - (sx * sx) / L
             vy = ssy - (sy * sy) / L
-            with np.errstate(invalid='ignore', divide='ignore'):
+            with np.errstate(invalid="ignore", divide="ignore"):
                 R = num / np.sqrt(np.outer(vx, vy))
             R_abs = np.abs(R)
             mask = R_abs[iu_local] > best_abs[iu_local]
             if np.any(mask):
                 best_abs[iu_local] = np.where(mask, R_abs[iu_local], best_abs[iu_local])
-        ge_mask = (best_abs[iu_local] >= obs_max[iu_local])
+        ge_mask = best_abs[iu_local] >= obs_max[iu_local]
         if np.any(ge_mask):
-            ii = iu_local[0][ge_mask]; jj = iu_local[1][ge_mask]
+            ii = iu_local[0][ge_mask]
+            jj = iu_local[1][ge_mask]
             ge[ii, jj] += 1.0
             ge[jj, ii] += 1.0
     return ge
+
+
 try:
     from statsmodels.tsa.seasonal import STL  # Optional, for seasonal adjustment
+
     _HAS_STL = True
 except Exception:
     _HAS_STL = False
 
 try:
     from scipy.signal import fftconvolve  # type: ignore
+
     _HAS_FFTCONV = True
 except Exception:
     _HAS_FFTCONV = False
@@ -105,6 +136,7 @@ except Exception:
 try:
     import numba  # type: ignore
     from numba import njit
+
     _HAS_NUMBA = True
 except Exception:
     _HAS_NUMBA = False
@@ -115,6 +147,7 @@ _SHM_ARR_SHAPE: Tuple[int, int] | None = None
 _SHM_ARR_DTYPE: str | None = None
 _SHM_ARR_CACHE = threading.local()
 
+
 def _init_worker_shm(name: str, shape: Tuple[int, int], dtype_str: str) -> None:
     global _SHM_ARR_NAME, _SHM_ARR_SHAPE, _SHM_ARR_DTYPE
     _SHM_ARR_NAME = name
@@ -122,14 +155,16 @@ def _init_worker_shm(name: str, shape: Tuple[int, int], dtype_str: str) -> None:
     _SHM_ARR_DTYPE = dtype_str
     _SHM_ARR_CACHE.arr = None
 
+
 def _get_shm_array() -> np.ndarray:
-    if getattr(_SHM_ARR_CACHE, 'arr', None) is not None:
+    if getattr(_SHM_ARR_CACHE, "arr", None) is not None:
         return _SHM_ARR_CACHE.arr  # type: ignore
     assert _SHM_ARR_NAME and _SHM_ARR_SHAPE and _SHM_ARR_DTYPE
     shm = shared_memory.SharedMemory(name=_SHM_ARR_NAME)
     arr = np.ndarray(_SHM_ARR_SHAPE, dtype=np.dtype(_SHM_ARR_DTYPE), buffer=shm.buf)
     _SHM_ARR_CACHE.arr = arr
     return arr
+
 
 def _xcorr_perm_worker_batch_shm(
     T: int,
@@ -141,9 +176,12 @@ def _xcorr_perm_worker_batch_shm(
     arr = _get_shm_array()
     return _xcorr_perm_worker_batch(arr, T, n, max_lag_steps, obs_max, batch_shifts)
 
-import community.community_louvain as community_louvain # Explicitly for clarity
-from tgTrax.utils import tui # For console output
+
+import community.community_louvain as community_louvain  # Explicitly for clarity
+import logging
 from tgTrax.utils.cache import cache_get, cache_set, khash, default_ttl
+
+logger = logging.getLogger(__name__)
 
 
 # --- Constants ---
@@ -153,8 +191,13 @@ from tgTrax.utils.cache import cache_get, cache_set, khash, default_ttl
 # --- TemporalAnalyzer Class ---
 class TemporalAnalyzer:
     """
-    Analyzes temporal patterns in user activity data, focusing on correlations
-    and community structures.
+    Analyze temporal patterns and relationships across user activity series.
+
+    Focus areas:
+    - Correlation and cross-correlation (with lag search and FDR correction)
+    - Binary-activity Jaccard similarity
+    - Optional residualization by time-of-week and global factor
+    - Lightweight community detection support
     """
 
     def __init__(
@@ -181,16 +224,24 @@ class TemporalAnalyzer:
         residual_variance_stabilize: bool = True,
     ):
         """
-        Initializes the TemporalAnalyzer with activity data.
+        Initialize analyzer with activity data and preprocessing options.
 
         Args:
-            activity_df: DataFrame with a DateTimeIndex, columns for each user,
-                and boolean/int (0/1) values for online status.
-            resample_period: Pandas resampling period string (e.g., '1T' for
-                1 minute, '5T' for 5 minutes).
-            correlation_threshold: Default threshold for correlation significance.
-            jaccard_threshold: Default threshold for Jaccard significance.
-            debug_users: Optional usernames to emit compact debug samples for.
+            activity_df: DateTimeIndex DataFrame; columns are users; values 0/1.
+            resample_period: Resampling rule or 'auto'.
+            correlation_threshold: Default correlation significance threshold.
+            jaccard_threshold: Default Jaccard significance threshold.
+            debug_users: Optional list of usernames for compact debug samples.
+            ewma_alpha: Optional EWMA smoothing factor in (0, 1].
+            seasonal_adjust: Whether to apply seasonal adjustment (STL if avail).
+            resample_agg: Aggregation for resampling (max|mean|sum|any).
+            fill_missing: Missing policy for resampled frame (zero|ffill|nan).
+            max_lag_minutes: Max lag window for cross-correlation search.
+            corr_method: Correlation method ('spearman' or 'pearson').
+            fdr_alpha: Alpha for FDR correction (BH/BY).
+            residual_include_global: Include global factor in residualization.
+            residual_prior_strength: Prior strength for bucket smoothing.
+            residual_variance_stabilize: Apply Bernoulli variance stabilization.
         """
         self.default_correlation_threshold: float = correlation_threshold
         self.default_jaccard_threshold: float = jaccard_threshold  # New attribute
@@ -202,14 +253,17 @@ class TemporalAnalyzer:
         self.resample_seconds: Optional[float] = None
         self.debug_users: List[str] = debug_users or []
         # Store new options
-        self.ewma_alpha: Optional[float] = ewma_alpha if (ewma_alpha is None or 0 < ewma_alpha <= 1.0) else None
+        self.ewma_alpha: Optional[float] = (
+            ewma_alpha if (ewma_alpha is None or 0 < ewma_alpha <= 1.0) else None
+        )
         if ewma_alpha is not None and self.ewma_alpha is None:
-            tui.tui_print_warning(
-                f"ewma_alpha ({ewma_alpha}) is outside valid range (0,1]. Disabling EWMA."
+            logger.warning(
+                "ewma_alpha (%s) is outside valid range (0,1]. Disabling EWMA.",
+                ewma_alpha,
             )
         self.seasonal_adjust: bool = bool(seasonal_adjust and _HAS_STL)
         if seasonal_adjust and not _HAS_STL:
-            tui.tui_print_warning(
+            logger.warning(
                 "seasonal_adjust requested but statsmodels not available. Skipping seasonal adjustment."
             )
         self.max_lag_minutes: int = max(0, int(max_lag_minutes))
@@ -230,7 +284,7 @@ class TemporalAnalyzer:
         self._fp_resid: str | None = None
 
         if activity_df.empty:
-            tui.tui_print_warning(
+            logger.warning(
                 "TemporalAnalyzer initialized with an empty DataFrame."
             )
             self.df_resampled = pd.DataFrame()
@@ -249,7 +303,8 @@ class TemporalAnalyzer:
         self.user_list = activity_df.columns.tolist()
         activity_df_numeric: pd.DataFrame = activity_df.astype(float)
 
-        # Determine resample frequency (supports 'auto')
+        # Determine resample frequency (supports 'auto'). If 'auto', we
+        # estimate a reasonable bucket size from the median spacing of points.
         if (resample_period or "").lower() == "auto":
             resample_period = self._auto_resample_period(activity_df_numeric.index)
         # Resample and fill missing according to policy
@@ -266,9 +321,10 @@ class TemporalAnalyzer:
             df_rs = df_rs.ffill()
         # else: "nan" keeps NaNs
         self.df_resampled = df_rs
-        tui.tui_print_info(
-            f"Activity data resampled to {resample_period}. "
-            f"Shape: {self.df_resampled.shape}"
+        logger.info(
+            "Activity data resampled to %s. Shape: %s",
+            resample_period,
+            self.df_resampled.shape,
         )
 
         # Optional compact debug output for selected users
@@ -276,15 +332,19 @@ class TemporalAnalyzer:
             for dbg_user in self.debug_users:
                 if dbg_user in self.df_resampled.columns:
                     series_dbg = self.df_resampled[dbg_user]
-                    tui.tui_print_debug(
-                        f"Resampled sample for {dbg_user} (head5):\n{series_dbg.head(5).to_string()}"
+                    logger.debug(
+                        "Resampled sample for %s (head5):\n%s",
+                        dbg_user,
+                        series_dbg.head(5).to_string(),
                     )
-                    tui.tui_print_debug(
-                        f"Resampled sample for {dbg_user} (tail5):\n{series_dbg.tail(5).to_string()}"
+                    logger.debug(
+                        "Resampled sample for %s (tail5):\n%s",
+                        dbg_user,
+                        series_dbg.tail(5).to_string(),
                     )
 
         # Cache frequency info once
-        self._infer_resample_offset_and_seconds()
+        self._infer_resample_offset_and_seconds()  # Cache step size in seconds
 
         # Prepare frame for correlation (preprocessing is optional)
         self.df_for_corr: pd.DataFrame = self._prepare_corr_frame(self.df_resampled)
@@ -319,11 +379,11 @@ class TemporalAnalyzer:
     # ---- Preprocessing for correlation ----
     def _frame_fingerprint(self, frame: pd.DataFrame | None, tag: str) -> str:
         if frame is None or frame.empty:
-            return khash(tag, 'empty')
+            return khash(tag, "empty")
         try:
             idx = frame.index
-            start = str(idx[0]) if len(idx) else 'na'
-            end = str(idx[-1]) if len(idx) else 'na'
+            start = str(idx[0]) if len(idx) else "na"
+            end = str(idx[-1]) if len(idx) else "na"
             shape = frame.shape
             arr = frame.to_numpy(dtype=float, copy=False)
             finite = np.isfinite(arr)
@@ -343,7 +403,11 @@ class TemporalAnalyzer:
         out = df.astype(float).copy()
         # Seasonal adjustment
         if self.seasonal_adjust and self.resample_seconds:
-            daily_period = int(round(24 * 3600 / float(self.resample_seconds))) if self.resample_seconds else None
+            daily_period = (
+                int(round(24 * 3600 / float(self.resample_seconds)))
+                if self.resample_seconds
+                else None
+            )
             if daily_period and daily_period >= 12 and len(out) >= daily_period * 2:
                 for col in out.columns:
                     try:
@@ -380,7 +444,7 @@ class TemporalAnalyzer:
         if freq_offset is None:
             # Fallback 1 minute step if not inferable
             freq_offset = pd.Timedelta(minutes=1)
-            tui.tui_print_warning(
+            logger.warning(
                 "Could not infer resample frequency, defaulting to 1 minute."
             )
 
@@ -400,7 +464,7 @@ class TemporalAnalyzer:
         try:
             if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 3:
                 return "1min"
-            diffs = np.diff(idx.view('i8'))  # in ns
+            diffs = np.diff(idx.view("i8"))  # in ns
             if diffs.size == 0:
                 return "1min"
             med_ns = np.median(diffs)
@@ -467,10 +531,12 @@ class TemporalAnalyzer:
             except Exception:
                 off_h = 0.0
             try:
-                idx_shift = idx + pd.to_timedelta(off_h, unit='h') if off_h else idx
+                idx_shift = idx + pd.to_timedelta(off_h, unit="h") if off_h else idx
             except Exception:
                 idx_shift = idx
-            bucket_j = (idx_shift.dayofweek.to_numpy() * 24 + idx_shift.hour.to_numpy()).astype(int)
+            bucket_j = (
+                idx_shift.dayofweek.to_numpy() * 24 + idx_shift.hour.to_numpy()
+            ).astype(int)
             buckets_per_user.append(bucket_j)
             counts[:, j] = np.bincount(bucket_j, minlength=168)
             sums[:, j] = np.bincount(bucket_j, weights=X[:, j], minlength=168)
@@ -479,7 +545,7 @@ class TemporalAnalyzer:
         alpha = max(0, int(prior_strength))
         p0 = np.clip(X.mean(axis=0), 1e-6, 1 - 1e-6)
         if alpha == 0:
-            with np.errstate(divide='ignore', invalid='ignore'):
+            with np.errstate(divide="ignore", invalid="ignore"):
                 p_hat = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0)
             p_hat = np.where(counts > 0, p_hat, p0[None, :])
         else:
@@ -517,30 +583,27 @@ class TemporalAnalyzer:
             pass
         return resid
 
-
     def _calculate_correlations(self, method: str = "spearman") -> pd.DataFrame:
         """
-        Calculates the correlation matrix between users\' online statuses.
+        Compute user-by-user correlation matrix on the prepared frame.
 
         Args:
-            method: The correlation method to use (e.g., \'spearman\', \'pearson\').
-                    Spearman is generally good for non-linear relationships and
-                    ordinal data.
+            method: Correlation method ('spearman' or 'pearson').
 
         Returns:
-            A pandas DataFrame representing the correlation matrix. Returns an
-            empty DataFrame if data is insufficient.
+            pd.DataFrame: Correlation matrix; empty if insufficient data.
         """
         if self.df_resampled.empty or len(self.df_resampled.columns) < 2:
-            tui.tui_print_warning(
-                "Not enough data or users to calculate correlations."
-            )
+            logger.warning("Not enough data or users to calculate correlations.")
             return pd.DataFrame()
 
-        base = self.df_for_corr if hasattr(self, "df_for_corr") and not self.df_for_corr.empty else self.df_resampled
+        base = (
+            self.df_for_corr
+            if hasattr(self, "df_for_corr") and not self.df_for_corr.empty
+            else self.df_resampled
+        )
         corr_matrix: pd.DataFrame = base.corr(method=method)
-        tui.tui_print_info(f"Correlation matrix calculated using {method} method.")
-        # tui.tui_print_debug(f"Correlation Matrix:\\n{corr_matrix.to_string()}") # Verbose
+        logger.info("Correlation matrix calculated using %s method.", method)
         return corr_matrix
 
     # ---- Cross-correlation with lag search and FDR ----
@@ -551,24 +614,45 @@ class TemporalAnalyzer:
         fdr_alpha: float = 0.05,
         fdr_method: str = "by",
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Vectorized cross-correlation with lag search and BH-FDR q-values."""
+        """
+        Vectorized cross-correlation with lag search and FDR correction.
+
+        What it does:
+        - Scans lags (lead/lag in steps) between every pair of users.
+        - For each lag, computes a full correlation matrix using overlapping
+          windows only (to stay fair when shifting).
+        - Picks the best absolute correlation and the corresponding lag.
+        - Estimates p-values via random circular shifts (permutation idea).
+        - Applies FDR to control the expected fraction of false positives.
+
+        Returns:
+        - max r: strongest correlation for each pair across lags.
+        - best lag (seconds): the lag where this max r happens.
+        - p-values: probability the observed or stronger result appears by
+          chance under random shifts.
+        - q-values: FDR-adjusted p-values (lower means more reliable).
+        """
         # cache key
         try:
-            fp = self._frame_fingerprint(self.df_for_corr, 'for_corr')
-            users = list(self.df_for_corr.columns) if self.df_for_corr is not None else []
+            fp = self._frame_fingerprint(self.df_for_corr, "for_corr")
+            users = (
+                list(self.df_for_corr.columns) if self.df_for_corr is not None else []
+            )
             key = f"tgtrax:xcorr_scan:{khash(method, max_lag_minutes, self.resample_seconds, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
-                    pd.DataFrame(cached['r'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['lag'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['p'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["r"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(
+                        cached["lag"], index=users, columns=users, dtype=float
+                    ),
+                    pd.DataFrame(cached["p"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
         if self.df_for_corr.empty or len(self.df_for_corr.columns) < 2:
-            tui.tui_print_warning("Not enough data for cross-correlation.")
+            logger.warning("Not enough data for cross-correlation.")
             empty = pd.DataFrame()
             return empty, empty, empty, empty
 
@@ -577,10 +661,14 @@ class TemporalAnalyzer:
             try:
                 inferred = pd.infer_freq(self.df_for_corr.index)
                 step = pd.tseries.frequencies.to_offset(inferred)
-                seconds = float(getattr(step, "nanos", pd.to_timedelta(step).value)) / 1e9
+                seconds = (
+                    float(getattr(step, "nanos", pd.to_timedelta(step).value)) / 1e9
+                )
                 self.resample_seconds = seconds
             except Exception:
                 self.resample_seconds = 60.0
+            # resample_seconds: the size of one step (bucket) in seconds, used
+            # to convert best lag in steps into seconds for human readability.
 
         arr0 = self.df_for_corr.values.astype(float)
         if method != "pearson":
@@ -602,20 +690,24 @@ class TemporalAnalyzer:
 
         iu = np.triu_indices(n, k=1)
 
-        def corr_matrix_xy(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        def corr_matrix_xy(
+            X: np.ndarray, Y: np.ndarray
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             L = X.shape[0]
             sx = X.sum(axis=0)
             sy = Y.sum(axis=0)
-            ssx = np.einsum('ij,ij->j', X, X)
-            ssy = np.einsum('ij,ij->j', Y, Y)
+            ssx = np.einsum("ij,ij->j", X, X)
+            ssy = np.einsum("ij,ij->j", Y, Y)
             sxy = X.T @ Y
             num = sxy - np.outer(sx, sy) / L
             vx = ssx - (sx * sx) / L
             vy = ssy - (sy * sy) / L
-            with np.errstate(invalid='ignore', divide='ignore'):
+            with np.errstate(invalid="ignore", divide="ignore"):
                 R = num / np.sqrt(np.outer(vx, vy))
             return R, vx, vy
 
+        # Try all lags from -K to +K. Negative: Y leads X. Positive: X leads Y.
+        # We always use overlapping segments only (no padding) to keep fairness.
         for k in range(-K, K + 1):
             if k == 0:
                 L = T
@@ -658,8 +750,11 @@ class TemporalAnalyzer:
         if student_t is not None:
             r_vec = best_r[iu]
             L_vec = best_L[iu].astype(float)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                t_stat = r_vec * np.sqrt(np.maximum(L_vec - 2.0, 1.0) / np.maximum(1e-12, 1.0 - r_vec * r_vec))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t_stat = r_vec * np.sqrt(
+                    np.maximum(L_vec - 2.0, 1.0)
+                    / np.maximum(1e-12, 1.0 - r_vec * r_vec)
+                )
             df = np.maximum(L_vec - 2.0, 1.0)
             p_vec = 2.0 * student_t.sf(np.abs(t_stat), df)
             # Multiple-lag scan correction (per-pair Bonferroni)
@@ -683,8 +778,11 @@ class TemporalAnalyzer:
         qvals[iu] = qvec
         qvals = qvals + qvals.T
         np.fill_diagonal(qvals, np.nan)
-        
-        tui.tui_print_info(f"Cross-correlation computed (vectorized) with lag window ±{max_lag_minutes} min.")
+
+        logger.info(
+            "Cross-correlation computed (vectorized) with lag window ±%s min.",
+            max_lag_minutes,
+        )
         out = (
             pd.DataFrame(best_r, index=users, columns=users, dtype=float),
             pd.DataFrame(lag_seconds, index=users, columns=users, dtype=float),
@@ -692,7 +790,11 @@ class TemporalAnalyzer:
             pd.DataFrame(qvals, index=users, columns=users, dtype=float),
         )
         try:
-            cache_set(key, {"r": best_r, "lag": lag_seconds, "p": pvals, "q": qvals}, ttl=default_ttl('heavy'))
+            cache_set(
+                key,
+                {"r": best_r, "lag": lag_seconds, "p": pvals, "q": qvals},
+                ttl=default_ttl("heavy"),
+            )
         except Exception:
             pass
         return out
@@ -712,7 +814,11 @@ class TemporalAnalyzer:
         if self.df_resampled.empty or len(self.df_resampled.columns) < 2:
             empty = pd.DataFrame()
             return empty, empty, empty, empty
-        frame = self.df_resid if (residualize and self.df_resid is not None) else self.df_for_corr
+        frame = (
+            self.df_resid
+            if (residualize and self.df_resid is not None)
+            else self.df_for_corr
+        )
         if frame is None or frame.empty:
             empty = pd.DataFrame()
             return empty, empty, empty, empty
@@ -721,24 +827,28 @@ class TemporalAnalyzer:
             try:
                 inferred = pd.infer_freq(frame.index)
                 step = pd.tseries.frequencies.to_offset(inferred)
-                seconds = float(getattr(step, "nanos", pd.to_timedelta(step).value)) / 1e9
+                seconds = (
+                    float(getattr(step, "nanos", pd.to_timedelta(step).value)) / 1e9
+                )
                 self.resample_seconds = seconds
             except Exception:
                 self.resample_seconds = 60.0
 
         # cache
         try:
-            fp = self._frame_fingerprint(frame, 'resid' if residualize else 'for_corr')
+            fp = self._frame_fingerprint(frame, "resid" if residualize else "for_corr")
             users = list(frame.columns)
             Kmin = self.max_lag_minutes if max_lag_minutes is None else max_lag_minutes
             key = f"tgtrax:xcorr_on_demand:{khash(method, Kmin, residualize, fdr_method, self.resample_seconds, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
-                    pd.DataFrame(cached['r'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['lag'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['p'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["r"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(
+                        cached["lag"], index=users, columns=users, dtype=float
+                    ),
+                    pd.DataFrame(cached["p"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
@@ -754,7 +864,22 @@ class TemporalAnalyzer:
 
         T, n = arr.shape
         users = list(frame.columns)
-        K = max(0, int(round(((self.max_lag_minutes if max_lag_minutes is None else max_lag_minutes) * 60.0) / float(self.resample_seconds))))
+        K = max(
+            0,
+            int(
+                round(
+                    (
+                        (
+                            self.max_lag_minutes
+                            if max_lag_minutes is None
+                            else max_lag_minutes
+                        )
+                        * 60.0
+                    )
+                    / float(self.resample_seconds)
+                )
+            ),
+        )
 
         best_abs = np.full((n, n), -1.0, dtype=float)
         best_r = np.zeros((n, n), dtype=float)
@@ -762,17 +887,19 @@ class TemporalAnalyzer:
         best_L = np.zeros((n, n), dtype=int)
         iu = np.triu_indices(n, k=1)
 
-        def corr_matrix_xy(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        def corr_matrix_xy(
+            X: np.ndarray, Y: np.ndarray
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             L = X.shape[0]
             sx = X.sum(axis=0)
             sy = Y.sum(axis=0)
-            ssx = np.einsum('ij,ij->j', X, X)
-            ssy = np.einsum('ij,ij->j', Y, Y)
+            ssx = np.einsum("ij,ij->j", X, X)
+            ssy = np.einsum("ij,ij->j", Y, Y)
             sxy = X.T @ Y
             num = sxy - np.outer(sx, sy) / L
             vx = ssx - (sx * sx) / L
             vy = ssy - (sy * sy) / L
-            with np.errstate(invalid='ignore', divide='ignore'):
+            with np.errstate(invalid="ignore", divide="ignore"):
                 R = num / np.sqrt(np.outer(vx, vy))
             return R, vx, vy
 
@@ -815,8 +942,11 @@ class TemporalAnalyzer:
         if student_t is not None:
             r_vec = best_r[iu]
             L_vec = best_L[iu].astype(float)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                t_stat = r_vec * np.sqrt(np.maximum(L_vec - 2.0, 1.0) / np.maximum(1e-12, 1.0 - r_vec * r_vec))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t_stat = r_vec * np.sqrt(
+                    np.maximum(L_vec - 2.0, 1.0)
+                    / np.maximum(1e-12, 1.0 - r_vec * r_vec)
+                )
             df = np.maximum(L_vec - 2.0, 1.0)
             p_vec = 2.0 * student_t.sf(np.abs(t_stat), df)
             # Multiple lag selection correction (per-pair Bonferroni/Šidák)
@@ -839,7 +969,7 @@ class TemporalAnalyzer:
         qvals[iu] = qvec
         qvals = qvals + qvals.T
         np.fill_diagonal(qvals, np.nan)
-        
+
         out = (
             pd.DataFrame(best_r, index=users, columns=users, dtype=float),
             pd.DataFrame(lag_seconds, index=users, columns=users, dtype=float),
@@ -847,7 +977,11 @@ class TemporalAnalyzer:
             pd.DataFrame(qvals, index=users, columns=users, dtype=float),
         )
         try:
-            cache_set(key, {"r": best_r, "lag": lag_seconds, "p": pvals, "q": qvals}, ttl=default_ttl('heavy'))
+            cache_set(
+                key,
+                {"r": best_r, "lag": lag_seconds, "p": pvals, "q": qvals},
+                ttl=default_ttl("heavy"),
+            )
         except Exception:
             pass
         return out
@@ -879,28 +1013,42 @@ class TemporalAnalyzer:
         T = len(self.df_resampled.index)
         if T < 4:
             return pd.DataFrame(), pd.DataFrame()
-        max_lag = int(self.max_lag_minutes if max_lag_minutes is None else max_lag_minutes)
+        max_lag = int(
+            self.max_lag_minutes if max_lag_minutes is None else max_lag_minutes
+        )
         if max_lag <= 0 or self.resample_seconds is None:
             return pd.DataFrame(), pd.DataFrame()
-        max_lag_steps = max(1, int(round(max_lag * 60.0 / float(self.resample_seconds))))
+        max_lag_steps = max(
+            1, int(round(max_lag * 60.0 / float(self.resample_seconds)))
+        )
 
         # cache
         try:
-            frame = (self.df_resid if (use_residuals and self.df_resid is not None) else self.df_for_corr)
+            frame = (
+                self.df_resid
+                if (use_residuals and self.df_resid is not None)
+                else self.df_for_corr
+            )
             users = list(frame.columns) if frame is not None else []
-            fp = self._frame_fingerprint(frame, 'resid' if use_residuals else 'for_corr')
+            fp = self._frame_fingerprint(
+                frame, "resid" if use_residuals else "for_corr"
+            )
             key = f"tgtrax:xcorr_perm:{khash(method, perms, max_lag, use_residuals, random_state, n_jobs, batch_size, fdr_method, self.resample_seconds, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
-                    pd.DataFrame(cached['p'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["p"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
 
         rng = np.random.default_rng(random_state)
-        frame = (self.df_resid if (use_residuals and self.df_resid is not None) else self.df_for_corr).astype(float)
+        frame = (
+            self.df_resid
+            if (use_residuals and self.df_resid is not None)
+            else self.df_for_corr
+        ).astype(float)
         arr0 = frame.values  # (T, n)
         # Spearman as ranks + Pearson (faster):
         if method != "pearson":
@@ -914,15 +1062,18 @@ class TemporalAnalyzer:
 
         # Observed maximum |r|
         obs_max = np.full((n, n), np.nan, dtype=float)
-        if not getattr(self, "crosscorr_max", pd.DataFrame()).empty and list(self.crosscorr_max.columns) == users:
+        if (
+            not getattr(self, "crosscorr_max", pd.DataFrame()).empty
+            and list(self.crosscorr_max.columns) == users
+        ):
             obs_mat = self.crosscorr_max.values
             obs_max[:, :] = np.abs(obs_mat)
         else:
             sx = arr.sum(axis=0)
-            ss = np.einsum('ij,ij->j', arr, arr)
+            ss = np.einsum("ij,ij->j", arr, arr)
             num = arr.T @ arr - np.outer(sx, sx) / T
             var = ss - (sx * sx) / T
-            with np.errstate(invalid='ignore', divide='ignore'):
+            with np.errstate(invalid="ignore", divide="ignore"):
                 R0 = num / np.sqrt(np.outer(var, var))
             obs_max = np.abs(R0)
 
@@ -930,7 +1081,9 @@ class TemporalAnalyzer:
         shifts = rng.integers(low=0, high=T, size=perms, dtype=np.int64)
         if batch_size < 1:
             batch_size = 16
-        batches = [shifts[i:i+batch_size] for i in range(0, len(shifts), batch_size)]
+        batches = [
+            shifts[i : i + batch_size] for i in range(0, len(shifts), batch_size)
+        ]
         if n_jobs is None:
             cpu = os.cpu_count() or 2
             n_jobs = max(1, min(4, cpu - 1))
@@ -938,26 +1091,45 @@ class TemporalAnalyzer:
         ge_counts = np.zeros((n, n), dtype=float)
         if n_jobs == 1 or len(batches) == 1:
             for b in batches:
-                ge_counts += _xcorr_perm_worker_batch(arr, T, n, max_lag_steps, obs_max, b)
+                ge_counts += _xcorr_perm_worker_batch(
+                    arr, T, n, max_lag_steps, obs_max, b
+                )
         else:
             try:
                 shm = shared_memory.SharedMemory(create=True, size=arr.nbytes)
                 try:
                     shm_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
                     shm_arr[:] = arr
-                    with ProcessPoolExecutor(max_workers=n_jobs, initializer=_init_worker_shm, initargs=(shm.name, arr.shape, str(arr.dtype))) as ex:
-                        futures = [ex.submit(_xcorr_perm_worker_batch_shm, T, n, max_lag_steps, obs_max, b) for b in batches]
+                    with ProcessPoolExecutor(
+                        max_workers=n_jobs,
+                        initializer=_init_worker_shm,
+                        initargs=(shm.name, arr.shape, str(arr.dtype)),
+                    ) as ex:
+                        futures = [
+                            ex.submit(
+                                _xcorr_perm_worker_batch_shm,
+                                T,
+                                n,
+                                max_lag_steps,
+                                obs_max,
+                                b,
+                            )
+                            for b in batches
+                        ]
                         for f in as_completed(futures):
                             ge_counts += f.result()
                 finally:
                     try:
-                        shm.close(); shm.unlink()
+                        shm.close()
+                        shm.unlink()
                     except Exception:
                         pass
             except Exception:
                 # Fallback to single-threaded processing if multiprocessing fails
                 for b in batches:
-                    ge_counts += _xcorr_perm_worker_batch(arr, T, n, max_lag_steps, obs_max, b)
+                    ge_counts += _xcorr_perm_worker_batch(
+                        arr, T, n, max_lag_steps, obs_max, b
+                    )
         pvals = (ge_counts + 1.0) / float(perms + 1)
         np.fill_diagonal(pvals, np.nan)
         iu = np.triu_indices(n, k=1)
@@ -975,7 +1147,7 @@ class TemporalAnalyzer:
             pd.DataFrame(qvals, index=users, columns=users, dtype=float),
         )
         try:
-            cache_set(key, {"p": pvals, "q": qvals}, ttl=default_ttl('heavy'))
+            cache_set(key, {"p": pvals, "q": qvals}, ttl=default_ttl("heavy"))
         except Exception:
             pass
         return out
@@ -1037,7 +1209,6 @@ class TemporalAnalyzer:
     def get_crosscorr_qvals(self) -> pd.DataFrame:
         return self.crosscorr_qval
 
-
     def get_correlation_matrix(self) -> pd.DataFrame:
         """
         Retrieves the calculated correlation matrix.
@@ -1072,7 +1243,8 @@ class TemporalAnalyzer:
             for c in X.columns:
                 s = X[c].to_numpy(dtype=float)
                 if np.all(~np.isfinite(s)):
-                    X[c] = 0; continue
+                    X[c] = 0
+                    continue
                 # base threshold at median
                 t = float(np.nanmedian(s))
                 b = (s > t).astype(int)
@@ -1081,14 +1253,18 @@ class TemporalAnalyzer:
                     # adapt quantile toward achieving min/max bounds
                     # coarse search over quantiles
                     qs = np.linspace(0.2, 0.8, 7)
-                    best_q = q; best_diff = 1e9; best_b = b
+                    best_q = q
+                    best_diff = 1e9
+                    best_b = b
                     for qq in qs:
                         tt = float(np.nanquantile(s, qq))
                         bb = (s > tt).astype(int)
                         pp = float(np.nanmean(bb)) if bb.size else 0.0
                         diff = min(abs(pp - 0.5), abs(pp - min_p), abs(pp - max_p))
                         if diff < best_diff and (min_p <= pp <= max_p):
-                            best_diff = diff; best_q = qq; best_b = bb
+                            best_diff = diff
+                            best_q = qq
+                            best_b = bb
                     b = best_b
                 X[c] = b
             return X.astype(int)
@@ -1112,8 +1288,8 @@ class TemporalAnalyzer:
         xi = xi.astype(int)
         xj = xj.astype(int)
         a = xj[1:T]
-        b = xj[0:T-1]
-        c = xi[0:T-1]
+        b = xj[0 : T - 1]
+        c = xi[0 : T - 1]
         N = np.zeros((2, 2, 2), dtype=float)
         for k in range(T - 1):
             N[a[k], b[k], c[k]] += 1.0
@@ -1125,7 +1301,7 @@ class TemporalAnalyzer:
         Nb__ = np.sum(Nab_, axis=0)
         Pa_bc = N / Nb_c[None, :, :]
         Pa_b = Nab_ / Nb__[None, :]
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             ratio = Pa_bc / Pa_b[:, None, :]
             log_ratio = np.log(ratio)
         term = Pabc * np.nan_to_num(log_ratio, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1137,7 +1313,9 @@ class TemporalAnalyzer:
         _te_binary_k1 = njit(_te_binary_k1)  # type: ignore
 
     @staticmethod
-    def _stationary_bootstrap_1d(x: np.ndarray, p: float = 0.1, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    def _stationary_bootstrap_1d(
+        x: np.ndarray, p: float = 0.1, rng: Optional[np.random.Generator] = None
+    ) -> np.ndarray:
         if rng is None:
             rng = np.random.default_rng()
         T = len(x)
@@ -1175,22 +1353,32 @@ class TemporalAnalyzer:
         """
         if self.df_resampled.empty or len(self.df_resampled.columns) < 2:
             return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        frame = self.df_resid if (residualize and self.df_resid is not None) else self.df_resampled.astype(float)
+        frame = (
+            self.df_resid
+            if (residualize and self.df_resid is not None)
+            else self.df_resampled.astype(float)
+        )
         if frame is None or frame.empty:
-            frame = self.residualize_time() if residualize else self.df_resampled.astype(float)
+            frame = (
+                self.residualize_time()
+                if residualize
+                else self.df_resampled.astype(float)
+            )
         binf = self._quantize_binary(frame, method=quantize)
         users = list(binf.columns)
         n = len(users)
         # cache
         try:
-            fp = self._frame_fingerprint(binf, f"te_{quantize}_{'resid' if residualize else 'raw'}")
+            fp = self._frame_fingerprint(
+                binf, f"te_{quantize}_{'resid' if residualize else 'raw'}"
+            )
             key = f"tgtrax:te:{khash(perms, bootstrap, block_p, random_state, fdr_method, early_stop, alpha_stop, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
-                    pd.DataFrame(cached['te'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['p'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["te"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["p"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
@@ -1215,7 +1403,9 @@ class TemporalAnalyzer:
                         s = int(rng.integers(0, len(xi)))
                         xi_s = np.roll(xi, s)
                     else:
-                        xi_s = self._stationary_bootstrap_1d(xi, p=max(min(block_p, 0.99), 0.01), rng=rng)
+                        xi_s = self._stationary_bootstrap_1d(
+                            xi, p=max(min(block_p, 0.99), 0.01), rng=rng
+                        )
                     te_b = self._te_binary_k1(xi_s, xj)
                     if te_b >= te_obs:
                         ge += 1
@@ -1223,11 +1413,23 @@ class TemporalAnalyzer:
                         # Clopper–Pearson CI; stop if entirely above/below alpha_thr
                         if beta_dist is not None:
                             a = 0.05 / 2.0
-                            lo = float(beta_dist.ppf(a, max(ge, 0), (b + 1) - ge + 1)) if ge > 0 else 0.0
-                            hi = float(beta_dist.ppf(1 - a, ge + 1, max((b + 1) - ge, 0))) if ge < (b + 1) else 1.0
+                            lo = (
+                                float(beta_dist.ppf(a, max(ge, 0), (b + 1) - ge + 1))
+                                if ge > 0
+                                else 0.0
+                            )
+                            hi = (
+                                float(
+                                    beta_dist.ppf(1 - a, ge + 1, max((b + 1) - ge, 0))
+                                )
+                                if ge < (b + 1)
+                                else 1.0
+                            )
                         else:
                             ph = (ge + 1.0) / (b + 3.0)
-                            w = 1.96 * np.sqrt(max(ph * (1 - ph) / max(b + 1, 1), 1e-12))
+                            w = 1.96 * np.sqrt(
+                                max(ph * (1 - ph) / max(b + 1, 1), 1e-12)
+                            )
                             lo, hi = max(0.0, ph - w), min(1.0, ph + w)
                         if hi < alpha_thr or lo > alpha_thr:
                             perms = b + 1
@@ -1239,7 +1441,11 @@ class TemporalAnalyzer:
         mask = (~np.eye(n, dtype=bool)) & (~np.isnan(P))
         pvec = P[mask]
         if pvec.size > 0:
-            qvec = self._by_fdr(pvec) if (fdr_method or 'by').lower() == 'by' else self._bh_fdr(pvec)
+            qvec = (
+                self._by_fdr(pvec)
+                if (fdr_method or "by").lower() == "by"
+                else self._bh_fdr(pvec)
+            )
             Q = np.full_like(P, np.nan, dtype=float)
             Q[mask] = qvec
         else:
@@ -1250,7 +1456,7 @@ class TemporalAnalyzer:
             pd.DataFrame(Q, index=users, columns=users, dtype=float),
         )
         try:
-            cache_set(key, {"te": TE, "p": P, "q": Q}, ttl=default_ttl('heavy'))
+            cache_set(key, {"te": TE, "p": P, "q": Q}, ttl=default_ttl("heavy"))
         except Exception:
             pass
         return out
@@ -1267,6 +1473,7 @@ class TemporalAnalyzer:
         T = len(x)
         if T < 2 * min_seg_len:
             return cps
+
         def rec(a: int, b: int, depth: int) -> None:
             if depth >= max_chg:
                 return
@@ -1288,6 +1495,7 @@ class TemporalAnalyzer:
                 cps.append(cp)
                 rec(a, cp, depth + 1)
                 rec(cp, b, depth + 1)
+
         rec(0, T, 0)
         cps_sorted = sorted(set(cps))
         return cps_sorted
@@ -1299,13 +1507,19 @@ class TemporalAnalyzer:
         min_seg_len: int = 12,
         z_thr: float = 3.0,
     ) -> Dict[str, List[int]]:
-        frame = self.df_resid if (residualize and getattr(self, 'df_resid', None) is not None) else self.df_resampled.astype(float)
+        frame = (
+            self.df_resid
+            if (residualize and getattr(self, "df_resid", None) is not None)
+            else self.df_resampled.astype(float)
+        )
         if frame is None or frame.empty or frame.shape[1] < 1:
             return {}
         cps: Dict[str, List[int]] = {}
         for col in frame.columns:
             x = frame[col].to_numpy()
-            cps[col] = self._detect_changepoints_series(x, max_chg=max_chg, min_seg_len=min_seg_len, z_thr=z_thr)
+            cps[col] = self._detect_changepoints_series(
+                x, max_chg=max_chg, min_seg_len=min_seg_len, z_thr=z_thr
+            )
         return cps
 
     def co_changepoints_matrix(
@@ -1320,7 +1534,12 @@ class TemporalAnalyzer:
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         if self.df_resampled.empty or len(self.df_resampled.columns) < 2:
             return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        cps = self.detect_changepoints(residualize=residualize, max_chg=max_chg, min_seg_len=min_seg_len, z_thr=z_thr)
+        cps = self.detect_changepoints(
+            residualize=residualize,
+            max_chg=max_chg,
+            min_seg_len=min_seg_len,
+            z_thr=z_thr,
+        )
         users = [u for u in self.user_list if u in cps]
         n = len(users)
         if n < 2:
@@ -1328,6 +1547,7 @@ class TemporalAnalyzer:
         T = len(self.df_resampled.index)
         A = np.zeros((n, n), dtype=float)
         P = np.full((n, n), np.nan, dtype=float)
+
         # helper for matches within tolerance
         def match_count(a: np.ndarray, b: np.ndarray, tau: int) -> int:
             """Greedy 1-1 matching count within tolerance tau using two pointers.
@@ -1341,7 +1561,8 @@ class TemporalAnalyzer:
             j = 0
             cnt = 0
             while i < a.size and j < b.size:
-                ai = int(a[i]); bj = int(b[j])
+                ai = int(a[i])
+                bj = int(b[j])
                 if abs(ai - bj) <= tau:
                     cnt += 1
                     i += 1
@@ -1357,11 +1578,13 @@ class TemporalAnalyzer:
                     else:
                         j += 1
             return cnt
+
         # observed co-CP ratio: matches / min(len(ci),len(cj))
         cp_arr = [np.array(cps[u], dtype=int) for u in users]
         for i in range(n):
-            for j in range(i+1, n):
-                a = cp_arr[i]; b = cp_arr[j]
+            for j in range(i + 1, n):
+                a = cp_arr[i]
+                b = cp_arr[j]
                 m = match_count(a, b, tau_steps)
                 denom = max(1, min(len(a), len(b)))
                 val = float(m) / float(denom)
@@ -1369,8 +1592,9 @@ class TemporalAnalyzer:
         # permutation p-values via circular shift of one side
         rng = np.random.default_rng()
         for i in range(n):
-            for j in range(i+1, n):
-                a = cp_arr[i]; b = cp_arr[j]
+            for j in range(i + 1, n):
+                a = cp_arr[i]
+                b = cp_arr[j]
                 if len(a) == 0 or len(b) == 0:
                     P[i, j] = P[j, i] = np.nan
                     continue
@@ -1412,22 +1636,24 @@ class TemporalAnalyzer:
     ) -> float:
         # Build adjacency from co-cp with p<=alpha
         if co_cp is None or co_cp.empty or pvals is None or pvals.empty:
-            return float('nan')
+            return float("nan")
         users = list(co_cp.columns)
         n = len(users)
         import networkx as nx
+
         G = nx.Graph()
         for u in users:
             G.add_node(u)
         for i in range(n):
-            for j in range(i+1, n):
+            for j in range(i + 1, n):
                 u, v = users[i], users[j]
                 try:
                     p = float(pvals.iat[i, j])
                 except Exception:
-                    p = float('nan')
+                    p = float("nan")
                 if not np.isnan(p) and p <= alpha:
                     G.add_edge(u, v, w=float(co_cp.iat[i, j]))
+
         def comp_stat(graph: nx.Graph) -> float:
             if graph.number_of_edges() == 0:
                 return 0.0
@@ -1436,10 +1662,11 @@ class TemporalAnalyzer:
             for H in comps:
                 w = 0.0
                 for _, _, d in H.edges(data=True):
-                    w += float(d.get('w', 1.0))
+                    w += float(d.get("w", 1.0))
                 if w > best:
                     best = w
             return best
+
         obs = comp_stat(G)
         # Null via random rewiring preserving degree (fast heuristic)
         rng = np.random.default_rng()
@@ -1481,7 +1708,9 @@ class TemporalAnalyzer:
         X = self._binary_frame().to_numpy(dtype=np.int8, copy=False)
         T, n = X.shape
         if T < 2:
-            return np.zeros((T, n), dtype=np.int8), [np.array([], dtype=int) for _ in range(n)]
+            return np.zeros((T, n), dtype=np.int8), [
+                np.array([], dtype=int) for _ in range(n)
+            ]
         prev = np.vstack([np.zeros((1, n), dtype=np.int8), X[:-1, :]])
         starts = ((X == 1) & (prev == 0)).astype(np.int8)
         ev_idx = [np.where(starts[:, j] == 1)[0].astype(int) for j in range(n)]
@@ -1512,14 +1741,14 @@ class TemporalAnalyzer:
         users = list(self.df_resampled.columns)
         # cache
         try:
-            fp = self._frame_fingerprint(self.df_resampled, 'resampled')
+            fp = self._frame_fingerprint(self.df_resampled, "resampled")
             key = f"tgtrax:hawkes:{khash(half_life_minutes, max_lag_minutes, perms, random_state, fdr_method, self.resample_seconds, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
-                    pd.DataFrame(cached['S'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['P'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['Q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["S"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["P"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["Q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
@@ -1537,9 +1766,9 @@ class TemporalAnalyzer:
         for i in range(n):
             sig = starts[:, i].astype(float)
             if _HAS_FFTCONV and T > 1024:
-                ci = fftconvolve(sig, k, mode='full')[:T]
+                ci = fftconvolve(sig, k, mode="full")[:T]
             else:
-                ci = np.convolve(sig, k, mode='full')[:T]
+                ci = np.convolve(sig, k, mode="full")[:T]
             convs.append(ci)
 
         # Observed S_ij
@@ -1578,7 +1807,11 @@ class TemporalAnalyzer:
         mask = (~np.eye(n, dtype=bool)) & (~np.isnan(P))
         pvec = P[mask]
         if pvec.size > 0:
-            qvec = self._by_fdr(pvec) if (fdr_method or 'by').lower() == 'by' else self._bh_fdr(pvec)
+            qvec = (
+                self._by_fdr(pvec)
+                if (fdr_method or "by").lower() == "by"
+                else self._bh_fdr(pvec)
+            )
             Q = np.full_like(P, np.nan, dtype=float)
             Q[mask] = qvec
         else:
@@ -1590,12 +1823,14 @@ class TemporalAnalyzer:
             pd.DataFrame(Q, index=users, columns=users, dtype=float),
         )
         try:
-            cache_set(key, {"S": S, "P": P, "Q": Q}, ttl=default_ttl('heavy'))
+            cache_set(key, {"S": S, "P": P, "Q": Q}, ttl=default_ttl("heavy"))
         except Exception:
             pass
         return out
 
-    def compute_correlation_matrix(self, method: str = "spearman", residualize: bool = False) -> pd.DataFrame:
+    def compute_correlation_matrix(
+        self, method: str = "spearman", residualize: bool = False
+    ) -> pd.DataFrame:
         """Compute correlation matrix from selected frame on demand.
         If residualize=True and residuals available/possible, use them.
         """
@@ -1604,7 +1839,11 @@ class TemporalAnalyzer:
         if residualize:
             # extra guard in case legacy instances missed df_resid
             df_resid_local = getattr(self, "df_resid", None)
-            frame = df_resid_local if df_resid_local is not None else self.residualize_time()
+            frame = (
+                df_resid_local
+                if df_resid_local is not None
+                else self.residualize_time()
+            )
         else:
             frame = self.df_for_corr
         if frame is None or frame.empty:
@@ -1618,7 +1857,6 @@ class TemporalAnalyzer:
                     return frame.corr(method="spearman")
         except Exception:
             return pd.DataFrame()
-
 
     def compute_correlation_pq(
         self,
@@ -1638,15 +1876,19 @@ class TemporalAnalyzer:
         users = list(mat.columns)
         # cache
         try:
-            frame0 = self.df_resid if (residualize and getattr(self, 'df_resid', None) is not None) else self.df_for_corr
-            fp = self._frame_fingerprint(frame0, 'resid' if residualize else 'for_corr')
+            frame0 = (
+                self.df_resid
+                if (residualize and getattr(self, "df_resid", None) is not None)
+                else self.df_for_corr
+            )
+            fp = self._frame_fingerprint(frame0, "resid" if residualize else "for_corr")
             key = f"tgtrax:corr_pq:{khash(method, residualize, fdr_method, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
                     mat,
-                    pd.DataFrame(cached['p'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["p"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
@@ -1656,7 +1898,11 @@ class TemporalAnalyzer:
         if student_t is not None:
             iu = np.triu_indices(n, k=1)
             # estimate lag-1 autocorrelation on working frame (for Neff)
-            frame0 = self.df_resid if residualize and getattr(self, 'df_resid', None) is not None else self.df_for_corr
+            frame0 = (
+                self.df_resid
+                if residualize and getattr(self, "df_resid", None) is not None
+                else self.df_for_corr
+            )
             acf1: Dict[int, float] = {}
             if frame0 is not None and not frame0.empty:
                 for col_idx, col in enumerate(frame0.columns):
@@ -1671,7 +1917,11 @@ class TemporalAnalyzer:
             for k in range(len(iu[0])):
                 i, j = iu[0][k], iu[1][k]
                 # Length without NaN
-                s_pair = frame0.iloc[:, [i, j]] if (frame0 is not None and frame0.shape[1] >= j+1) else None
+                s_pair = (
+                    frame0.iloc[:, [i, j]]
+                    if (frame0 is not None and frame0.shape[1] >= j + 1)
+                    else None
+                )
                 if s_pair is None or s_pair.empty:
                     continue
                 s2 = s_pair.dropna()
@@ -1680,10 +1930,11 @@ class TemporalAnalyzer:
                     continue
                 r = float(mat.iat[i, j])
                 # Effective sample size (Bartlett lag-1 approx)
-                r1x = float(acf1.get(i, 0.0)); r1y = float(acf1.get(j, 0.0))
+                r1x = float(acf1.get(i, 0.0))
+                r1y = float(acf1.get(j, 0.0))
                 neff = L * (1.0 - r1x * r1y) / (1.0 + r1x * r1y)
                 neff = float(max(3.0, min(L, neff)))
-                with np.errstate(divide='ignore', invalid='ignore'):
+                with np.errstate(divide="ignore", invalid="ignore"):
                     t_stat = r * np.sqrt(max(neff - 2.0, 1.0) / max(1e-12, 1.0 - r * r))
                 dfv = max(neff - 2.0, 1.0)
                 p = 2.0 * student_t.sf(abs(t_stat), dfv)
@@ -1706,7 +1957,7 @@ class TemporalAnalyzer:
             pd.DataFrame(qvals, index=users, columns=users, dtype=float),
         )
         try:
-            cache_set(key, {"p": pvals, "q": qvals}, ttl=default_ttl('medium'))
+            cache_set(key, {"p": pvals, "q": qvals}, ttl=default_ttl("medium"))
         except Exception:
             pass
         return out
@@ -1729,9 +1980,7 @@ class TemporalAnalyzer:
             Returns an empty list if the correlation matrix is empty.
         """
         current_threshold: float = (
-            threshold
-            if threshold is not None
-            else self.default_correlation_threshold
+            threshold if threshold is not None else self.default_correlation_threshold
         )
 
         if self.correlation_matrix.empty:
@@ -1751,7 +2000,7 @@ class TemporalAnalyzer:
                     significant_pairs.append(((user1, user2), correlation_value))
 
         significant_pairs.sort(key=lambda x: abs(x[1]), reverse=True)
-        tui.tui_print_info(
+        logger.info(
             f"Found {len(significant_pairs)} significant pairs "
             f"with threshold >= {abs(current_threshold):.2f}"
         )
@@ -1777,19 +2026,29 @@ class TemporalAnalyzer:
                 q = float(self.crosscorr_qval.iat[i, j])
                 if np.isnan(q) or q > qt or abs(r) < min_abs_corr:
                     continue
-                lag_s = float(self.crosscorr_best_lag_seconds.iat[i, j]) if not self.crosscorr_best_lag_seconds.empty else 0.0
-                p = float(self.crosscorr_pval.iat[i, j]) if not self.crosscorr_pval.empty else np.nan
-                out.append(((users[i], users[j]), {"r": r, "lag_seconds": lag_s, "p": p, "q": q}))
+                lag_s = (
+                    float(self.crosscorr_best_lag_seconds.iat[i, j])
+                    if not self.crosscorr_best_lag_seconds.empty
+                    else 0.0
+                )
+                p = (
+                    float(self.crosscorr_pval.iat[i, j])
+                    if not self.crosscorr_pval.empty
+                    else np.nan
+                )
+                out.append(
+                    (
+                        (users[i], users[j]),
+                        {"r": r, "lag_seconds": lag_s, "p": p, "q": q},
+                    )
+                )
         out.sort(key=lambda x: abs(x[1]["r"]), reverse=True)
-        tui.tui_print_info(
+        logger.info(
             f"Found {len(out)} cross-corr significant pairs (q <= {qt})."
         )
         return out
 
-
-    def build_correlation_graph(
-        self, threshold: Optional[float] = None
-    ) -> nx.Graph:
+    def build_correlation_graph(self, threshold: Optional[float] = None) -> nx.Graph:
         """
         Creates a NetworkX graph based on significant user correlations.
 
@@ -1805,16 +2064,12 @@ class TemporalAnalyzer:
             A NetworkX graph. Nodes will have a \'community\' attribute.
         """
         current_threshold: float = (
-            threshold
-            if threshold is not None
-            else self.default_correlation_threshold
+            threshold if threshold is not None else self.default_correlation_threshold
         )
-        
+
         graph = nx.Graph()
         if self.df_resampled.empty or not self.user_list:
-            tui.tui_print_warning(
-                "Cannot build graph: No resampled data or user list."
-            )
+            logger.warning("Cannot build graph: No resampled data or user list.")
             return graph
 
         for user in self.user_list:
@@ -1829,15 +2084,16 @@ class TemporalAnalyzer:
                 graph.add_edge(user1, user2, weight=round(weight, 3))
 
         if not graph.edges():
-            tui.tui_print_info(
-                f"Correlation graph built, but no edges found "
-                f"with threshold {abs(current_threshold):.2f}."
+            logger.info(
+                "Correlation graph built, but no edges found with threshold %.2f.",
+                abs(current_threshold),
             )
         else:
-            tui.tui_print_info(
-                f"Correlation graph built with {graph.number_of_nodes()} nodes "
-                f"and {graph.number_of_edges()} edges "
-                f"(threshold {abs(current_threshold):.2f})."
+            logger.info(
+                "Correlation graph built with %s nodes and %s edges (threshold %.2f).",
+                graph.number_of_nodes(),
+                graph.number_of_edges(),
+                abs(current_threshold),
             )
 
         # Community detection
@@ -1848,18 +2104,16 @@ class TemporalAnalyzer:
                 )
                 nx.set_node_attributes(graph, partition, "community")
                 num_communities: int = len(set(partition.values()))
-                tui.tui_print_info(
-                    f"Community detection applied. Found {num_communities} communities."
+                logger.info(
+                    "Community detection applied. Found %s communities.", num_communities
                 )
             except Exception as e:
-                tui.tui_print_error(f"Error during community detection: {e}")
+                logger.error("Error during community detection: %s", e)
         else:
-            tui.tui_print_info(
+            logger.info(
                 "Skipping community detection as there are no edges in the graph."
             )
-            default_partition: Dict[str, int] = {
-                node: 0 for node in graph.nodes()
-            }
+            default_partition: Dict[str, int] = {node: 0 for node in graph.nodes()}
             nx.set_node_attributes(graph, default_partition, "community")
 
         return graph
@@ -1870,7 +2124,7 @@ class TemporalAnalyzer:
         jaccard_threshold: Optional[float] = None,
         qval_threshold: Optional[float] = None,
         weight_alpha: float = 0.6,  # weight for correlation component
-        weight_beta: float = 0.4,   # weight for jaccard component
+        weight_beta: float = 0.4,  # weight for jaccard component
         residualize: bool = False,
         fdr_method: str = "bh",
         use_runtime_xcorr: bool = True,
@@ -1885,8 +2139,16 @@ class TemporalAnalyzer:
 
         Edge weight = weight_alpha * max(|corr|, |crosscorr|) + weight_beta * jaccard.
         """
-        ct = self.default_correlation_threshold if corr_threshold is None else corr_threshold
-        jt = self.default_jaccard_threshold if jaccard_threshold is None else jaccard_threshold
+        ct = (
+            self.default_correlation_threshold
+            if corr_threshold is None
+            else corr_threshold
+        )
+        jt = (
+            self.default_jaccard_threshold
+            if jaccard_threshold is None
+            else jaccard_threshold
+        )
         qt = self.fdr_alpha if qval_threshold is None else qval_threshold
 
         graph = nx.Graph()
@@ -1897,19 +2159,39 @@ class TemporalAnalyzer:
 
         users = list(self.user_list)
         # choose matrices
-        corr_mat = self.compute_correlation_matrix(method=self.corr_method, residualize=residualize)
+        corr_mat = self.compute_correlation_matrix(
+            method=self.corr_method, residualize=residualize
+        )
         jacc_mat = self.get_jaccard_matrix()
         if use_runtime_xcorr:
-            xr_mat, _lag, _pv, q_mat = self.compute_crosscorr_with_lag(method=self.corr_method, residualize=residualize, fdr_method=fdr_method)
+            xr_mat, _lag, _pv, q_mat = self.compute_crosscorr_with_lag(
+                method=self.corr_method, residualize=residualize, fdr_method=fdr_method
+            )
         else:
             xr_mat, q_mat = self.crosscorr_max, self.crosscorr_qval
         for i in range(len(users)):
             for j in range(i + 1, len(users)):
                 u, v = users[i], users[j]
-                corr = float(corr_mat.get(u, pd.Series()).get(v, np.nan)) if not corr_mat.empty else np.nan
-                jacc = float(jacc_mat.get(u, pd.Series()).get(v, np.nan)) if not jacc_mat.empty else np.nan
-                xr = float(xr_mat.get(u, pd.Series()).get(v, np.nan)) if not xr_mat.empty else np.nan
-                qv = float(q_mat.get(u, pd.Series()).get(v, np.nan)) if not q_mat.empty else np.nan
+                corr = (
+                    float(corr_mat.get(u, pd.Series()).get(v, np.nan))
+                    if not corr_mat.empty
+                    else np.nan
+                )
+                jacc = (
+                    float(jacc_mat.get(u, pd.Series()).get(v, np.nan))
+                    if not jacc_mat.empty
+                    else np.nan
+                )
+                xr = (
+                    float(xr_mat.get(u, pd.Series()).get(v, np.nan))
+                    if not xr_mat.empty
+                    else np.nan
+                )
+                qv = (
+                    float(q_mat.get(u, pd.Series()).get(v, np.nan))
+                    if not q_mat.empty
+                    else np.nan
+                )
 
                 include = False
                 if not np.isnan(corr) and abs(corr) >= ct:
@@ -1920,8 +2202,10 @@ class TemporalAnalyzer:
                     include = True
 
                 if include:
-                    corr_like = max(abs(corr) if not np.isnan(corr) else 0.0,
-                                    abs(xr) if not np.isnan(xr) else 0.0)
+                    corr_like = max(
+                        abs(corr) if not np.isnan(corr) else 0.0,
+                        abs(xr) if not np.isnan(xr) else 0.0,
+                    )
                     j_like = jacc if not np.isnan(jacc) else 0.0
                     # fixed vs learned fusion (learned to be plugged via API)
                     if (mode or "fixed").lower() == "learned":
@@ -1929,29 +2213,40 @@ class TemporalAnalyzer:
                         weight = weight_alpha * corr_like + weight_beta * j_like
                     else:
                         weight = weight_alpha * corr_like + weight_beta * j_like
-                    graph.add_edge(u, v, weight=round(weight, 3), corr=round(corr, 3) if not np.isnan(corr) else None,
-                                   crosscorr=round(xr, 3) if not np.isnan(xr) else None,
-                                   qval=round(qv, 3) if not np.isnan(qv) else None,
-                                   jaccard=round(j_like, 3) if j_like else 0.0)
+                    graph.add_edge(
+                        u,
+                        v,
+                        weight=round(weight, 3),
+                        corr=round(corr, 3) if not np.isnan(corr) else None,
+                        crosscorr=round(xr, 3) if not np.isnan(xr) else None,
+                        qval=round(qv, 3) if not np.isnan(qv) else None,
+                        jaccard=round(j_like, 3) if j_like else 0.0,
+                    )
 
         # Communities
         if graph.number_of_edges() > 0:
             try:
-                partition: Dict[str, int] = community_louvain.best_partition(graph, weight="weight", random_state=42)
+                partition: Dict[str, int] = community_louvain.best_partition(
+                    graph, weight="weight", random_state=42
+                )
                 nx.set_node_attributes(graph, partition, "community")
-                tui.tui_print_info(
-                    f"Combined graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges."
+                logger.info(
+                    "Combined graph: %s nodes, %s edges.",
+                    graph.number_of_nodes(),
+                    graph.number_of_edges(),
                 )
                 # modularity significance vs degree-preserving null
                 try:
-                    Q_obs, p_mod = self.modularity_significance(graph, B=200, random_state=42)
+                    Q_obs, p_mod = self.modularity_significance(
+                        graph, B=200, random_state=42
+                    )
                     graph.graph["Q_obs"] = float(Q_obs)
                     graph.graph["p_mod"] = float(p_mod)
-                    tui.tui_print_info(f"Modularity Q={Q_obs:.3f}, p_mod={p_mod:.3f}")
+                    logger.info("Modularity Q=%.3f, p_mod=%.3f", Q_obs, p_mod)
                 except Exception as e:
-                    tui.tui_print_warning(f"Modularity significance skipped: {e}")
+                    logger.warning("Modularity significance skipped: %s", e)
             except Exception as e:
-                tui.tui_print_error(f"Community detection failed on combined graph: {e}")
+                logger.error("Community detection failed on combined graph: %s", e)
         return graph
 
     @staticmethod
@@ -1961,7 +2256,9 @@ class TemporalAnalyzer:
             comm[int(c)].append(node)
         return list(comm.values())
 
-    def modularity_significance(self, G: nx.Graph, B: int = 500, random_state: Optional[int] = None) -> Tuple[float, float]:
+    def modularity_significance(
+        self, G: nx.Graph, B: int = 500, random_state: Optional[int] = None
+    ) -> Tuple[float, float]:
         """Test observed modularity vs degree-preserving null via rewiring.
 
         Returns (Q_obs, p_value) where p-value = P(Q_null >= Q_obs).
@@ -1971,7 +2268,9 @@ class TemporalAnalyzer:
         except Exception:
             part = {n: 0 for n in G.nodes}
         try:
-            Q_obs = nx.algorithms.community.quality.modularity(G, self._part_to_communities(part), weight="weight")
+            Q_obs = nx.algorithms.community.quality.modularity(
+                G, self._part_to_communities(part), weight="weight"
+            )
         except Exception:
             Q_obs = 0.0
         rng = np.random.default_rng(random_state)
@@ -1984,8 +2283,12 @@ class TemporalAnalyzer:
             except Exception:
                 pass
             try:
-                p_b = community_louvain.best_partition(H, weight="weight", random_state=int(rng.integers(0, 1_000_000)))
-                Q_b = nx.algorithms.community.quality.modularity(H, self._part_to_communities(p_b), weight="weight")
+                p_b = community_louvain.best_partition(
+                    H, weight="weight", random_state=int(rng.integers(0, 1_000_000))
+                )
+                Q_b = nx.algorithms.community.quality.modularity(
+                    H, self._part_to_communities(p_b), weight="weight"
+                )
             except Exception:
                 Q_b = 0.0
             if Q_b >= Q_obs:
@@ -2006,7 +2309,13 @@ class TemporalAnalyzer:
 
         Edge i→j exists if q_te[i,j] <= qval_threshold.
         """
-        te, pmat, qmat = self.compute_transfer_entropy(residualize=residualize, perms=perms, bootstrap=bootstrap, block_p=block_p, fdr_method=fdr_method)
+        te, pmat, qmat = self.compute_transfer_entropy(
+            residualize=residualize,
+            perms=perms,
+            bootstrap=bootstrap,
+            block_p=block_p,
+            fdr_method=fdr_method,
+        )
         G = nx.DiGraph()
         users = list(te.columns) if not te.empty else self.user_list
         for u in users:
@@ -2020,9 +2329,19 @@ class TemporalAnalyzer:
                     qv = float(qmat.iat[i, j])
                     tev = float(te.iat[i, j])
                 except Exception:
-                    qv, tev = float('nan'), float('nan')
+                    qv, tev = float("nan"), float("nan")
                 if not np.isnan(qv) and qv <= qt and not np.isnan(tev):
-                    G.add_edge(u, v, te=tev, p_te=float(pmat.iat[i, j]) if (pmat is not None and not pmat.empty) else None, q_te=qv)
+                    G.add_edge(
+                        u,
+                        v,
+                        te=tev,
+                        p_te=(
+                            float(pmat.iat[i, j])
+                            if (pmat is not None and not pmat.empty)
+                            else None
+                        ),
+                        q_te=qv,
+                    )
         return G
 
     def build_hawkes_graph(
@@ -2034,7 +2353,12 @@ class TemporalAnalyzer:
         fdr_method: str = "by",
     ) -> nx.DiGraph:
         """Build directed graph from Hawkes-like excitation with q-value threshold."""
-        S, P, Q = self.hawkes_excitation(half_life_minutes=half_life_minutes, max_lag_minutes=max_lag_minutes, perms=perms, fdr_method=fdr_method)
+        S, P, Q = self.hawkes_excitation(
+            half_life_minutes=half_life_minutes,
+            max_lag_minutes=max_lag_minutes,
+            perms=perms,
+            fdr_method=fdr_method,
+        )
         users = list(S.columns) if not S.empty else self.user_list
         G = nx.DiGraph()
         for u in users:
@@ -2048,13 +2372,30 @@ class TemporalAnalyzer:
                     qv = float(Q.iat[i, j])
                     sval = float(S.iat[i, j])
                 except Exception:
-                    qv, sval = float('nan'), float('nan')
+                    qv, sval = float("nan"), float("nan")
                 if not np.isnan(qv) and qv <= qt and not np.isnan(sval):
-                    G.add_edge(u, v, hawkes=sval, p_hawkes=float(P.iat[i, j]) if (P is not None and not P.empty) else None, q_hawkes=qv)
+                    G.add_edge(
+                        u,
+                        v,
+                        hawkes=sval,
+                        p_hawkes=(
+                            float(P.iat[i, j])
+                            if (P is not None and not P.empty)
+                            else None
+                        ),
+                        q_hawkes=qv,
+                    )
         return G
 
     # --- Hawkes MLE (pairwise) — placeholder stub for future enhancement ---
-    def hawkes_mle_pair(self, starts_i: np.ndarray, starts_j: np.ndarray, dt: float, max_lag_m: int, P: int = 2) -> Dict[str, Any]:
+    def hawkes_mle_pair(
+        self,
+        starts_i: np.ndarray,
+        starts_j: np.ndarray,
+        dt: float,
+        max_lag_m: int,
+        P: int = 2,
+    ) -> Dict[str, Any]:
         """Placeholder for Hawkes MLE on pair (i,j).
 
         Intended to fit μ, α_ij and kernel parameters via EM/Quasi-Newton and
@@ -2062,7 +2403,12 @@ class TemporalAnalyzer:
         """
         raise NotImplementedError("hawkess_mle_pair not implemented yet")
 
-    def learned_edge_probability(self, feature_frames_by_window: List[Dict[str, pd.DataFrame]], min_repeats: int = 2, alpha: float = 0.05) -> pd.DataFrame:
+    def learned_edge_probability(
+        self,
+        feature_frames_by_window: List[Dict[str, pd.DataFrame]],
+        min_repeats: int = 2,
+        alpha: float = 0.05,
+    ) -> pd.DataFrame:
         """Learn edge probabilities from windowed features (API sketch).
 
         feature_frames_by_window: list of dicts with keys like {'corr': df, 'jaccard': df, 'xcorr_q': df, 'te': df, ...}
@@ -2082,23 +2428,25 @@ class TemporalAnalyzer:
         if not users:
             return pd.DataFrame()
         n = len(users)
-        pair_index: List[Tuple[int, int]] = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        pair_index: List[Tuple[int, int]] = [
+            (i, j) for i in range(n) for j in range(i + 1, n)
+        ]
         # Labels
         y = np.zeros(len(pair_index), dtype=int)
         for w, d in enumerate(feature_frames_by_window):
             # decide significance in this window
             sig = np.zeros((n, n), dtype=bool)
-            q = d.get('xcorr_q') or d.get('q')
+            q = d.get("xcorr_q") or d.get("q")
             if q is not None and not q.empty:
                 qq = q.to_numpy()
-                with np.errstate(invalid='ignore'):
-                    sig |= (qq <= alpha)
-            jac = d.get('jaccard')
+                with np.errstate(invalid="ignore"):
+                    sig |= qq <= alpha
+            jac = d.get("jaccard")
             if jac is not None and not jac.empty:
-                sig |= (jac.to_numpy() >= 0.18)
-            corr = d.get('corr')
+                sig |= jac.to_numpy() >= 0.18
+            corr = d.get("corr")
             if corr is not None and not corr.empty:
-                sig |= (np.abs(corr.to_numpy()) >= 0.6)
+                sig |= np.abs(corr.to_numpy()) >= 0.6
             for idx, (i, j) in enumerate(pair_index):
                 if sig[i, j]:
                     y[idx] += 1
@@ -2106,6 +2454,7 @@ class TemporalAnalyzer:
         # Features from latest window if available
         last = feature_frames_by_window[-1]
         feats: List[np.ndarray] = []
+
         def get_flat(df: Optional[pd.DataFrame], fun=None) -> np.ndarray:
             if df is None or df.empty:
                 return np.zeros(len(pair_index), dtype=float)
@@ -2113,11 +2462,18 @@ class TemporalAnalyzer:
             if fun is not None:
                 A = fun(A)
             return np.array([A[i, j] for (i, j) in pair_index], dtype=float)
-        feats.append(get_flat(last.get('corr'), fun=lambda A: np.abs(A)))
-        feats.append(get_flat(last.get('jaccard')))
-        feats.append(get_flat(last.get('xcorr'), fun=lambda A: np.abs(A)))
-        feats.append(get_flat(last.get('xcorr_q'), fun=lambda A: 1.0 - np.nan_to_num(A, nan=1.0)))
-        X = np.stack(feats, axis=1) if feats else np.zeros((len(pair_index), 1), dtype=float)
+
+        feats.append(get_flat(last.get("corr"), fun=lambda A: np.abs(A)))
+        feats.append(get_flat(last.get("jaccard")))
+        feats.append(get_flat(last.get("xcorr"), fun=lambda A: np.abs(A)))
+        feats.append(
+            get_flat(last.get("xcorr_q"), fun=lambda A: 1.0 - np.nan_to_num(A, nan=1.0))
+        )
+        X = (
+            np.stack(feats, axis=1)
+            if feats
+            else np.zeros((len(pair_index), 1), dtype=float)
+        )
         # Simple logistic fit by gradient steps (avoid external deps)
         Xb = np.hstack([np.ones((X.shape[0], 1)), X])
         w = np.zeros(Xb.shape[1], dtype=float)
@@ -2133,10 +2489,7 @@ class TemporalAnalyzer:
             PI[i, j] = PI[j, i] = float(val)
         return pd.DataFrame(PI, index=users, columns=users, dtype=float)
 
-
-    def get_communities(
-        self, graph: nx.Graph | None = None
-    ) -> Dict[int, List[str]]:
+    def get_communities(self, graph: nx.Graph | None = None) -> Dict[int, List[str]]:
         """
         Extracts communities from a graph.
 
@@ -2161,7 +2514,7 @@ class TemporalAnalyzer:
             target_graph = graph
 
         if not target_graph or not target_graph.nodes():
-            tui.tui_print_warning(
+            logger.warning(
                 "Graph is empty or has no nodes. Cannot extract communities."
             )
             return {}
@@ -2183,7 +2536,6 @@ class TemporalAnalyzer:
         )
         return dict(sorted_communities_list)
 
-
     def get_users_sorted_by_correlation(
         self,
         top_n: Optional[int] = None,
@@ -2204,21 +2556,24 @@ class TemporalAnalyzer:
             in descending order.
         """
         if self.correlation_matrix.empty or len(self.correlation_matrix.columns) < 2:
-            tui.tui_print_info(
-                "Correlation matrix is empty or has less than 2 users. "
-                "Cannot sort by correlation."
+            logger.info(
+                "Correlation matrix is empty or has less than 2 users. Cannot sort by correlation."
             )
             return self.user_list[:top_n] if top_n else self.user_list
         # Build thresholded graph
         try:
-            G = self.build_correlation_graph(threshold=self.default_correlation_threshold)
+            G = self.build_correlation_graph(
+                threshold=self.default_correlation_threshold
+            )
             if G.number_of_edges() > 0:
                 cent: Dict[str, float]
                 if (centrality or "eigenvector").lower().startswith("page"):
                     cent = nx.pagerank(G, weight="weight")
                 else:
                     cent = nx.eigenvector_centrality_numpy(G, weight="weight")
-                sorted_users = sorted(cent.keys(), key=lambda u: cent.get(u, 0.0), reverse=True)
+                sorted_users = sorted(
+                    cent.keys(), key=lambda u: cent.get(u, 0.0), reverse=True
+                )
                 return sorted_users[:top_n] if top_n else sorted_users
         except Exception:
             pass
@@ -2227,10 +2582,15 @@ class TemporalAnalyzer:
         for user in self.correlation_matrix.columns:
             corrs_for_user: pd.Series = self.correlation_matrix[user].drop(user)
             abs_corrs: pd.Series = corrs_for_user.abs()
-            mean_abs_correlations[user] = abs_corrs.mean(skipna=True) if abs_corrs.notna().any() else 0.0
-        sorted_users = sorted(mean_abs_correlations.keys(), key=lambda u: mean_abs_correlations[u], reverse=True)
+            mean_abs_correlations[user] = (
+                abs_corrs.mean(skipna=True) if abs_corrs.notna().any() else 0.0
+            )
+        sorted_users = sorted(
+            mean_abs_correlations.keys(),
+            key=lambda u: mean_abs_correlations[u],
+            reverse=True,
+        )
         return sorted_users[:top_n] if top_n else sorted_users
-
 
     def get_activity_intervals(
         self, user_list: List[str] | None = None
@@ -2251,16 +2611,14 @@ class TemporalAnalyzer:
              \'Finish\': end_time_dt, \'Resource\': \'Online\' or \'Offline\'}
         """
         if self.df_resampled.empty:
-            tui.tui_print_warning(
+            logger.warning(
                 "Resampled DataFrame is empty. Cannot generate activity intervals."
             )
             return {}
 
         target_users: List[str] = user_list if user_list else self.user_list
         if not target_users:
-            tui.tui_print_warning(
-                "No target users specified for activity intervals."
-            )
+            logger.warning("No target users specified for activity intervals.")
             return {}
 
         all_user_intervals: Dict[str, List[Dict[str, Any]]] = {}
@@ -2272,9 +2630,9 @@ class TemporalAnalyzer:
 
         for user in target_users:
             if user not in self.df_resampled.columns:
-                tui.tui_print_warning(
-                    f"User {user} not found in resampled data. "
-                    "Skipping for interval generation."
+                logger.warning(
+                    "User %s not found in resampled data. Skipping for interval generation.",
+                    user,
                 )
                 continue
 
@@ -2301,7 +2659,7 @@ class TemporalAnalyzer:
                     # Status changed, record previous interval
                     # End time is the start of the current differing one
                     end_time_dt: pd.Timestamp = timestamp
-                    if start_time_dt is not None: # Ensure start_time_dt was set
+                    if start_time_dt is not None:  # Ensure start_time_dt was set
                         user_intervals.append(
                             {
                                 "Task": user,
@@ -2312,14 +2670,13 @@ class TemporalAnalyzer:
                         )
                     current_status_str = period_status_str
                     start_time_dt = timestamp
-            
+
             # Record the last interval
             if current_status_str is not None and start_time_dt is not None:
                 # End of last interval extends by one resample period duration
-                last_interval_end_time: pd.Timestamp = (
-                    user_activity.index[-1]
-                    + pd.to_timedelta(resample_freq_seconds, unit="s")
-                )
+                last_interval_end_time: pd.Timestamp = user_activity.index[
+                    -1
+                ] + pd.to_timedelta(resample_freq_seconds, unit="s")
                 user_intervals.append(
                     {
                         "Task": user,
@@ -2330,7 +2687,6 @@ class TemporalAnalyzer:
                 )
             all_user_intervals[user] = user_intervals
         return all_user_intervals
-
 
     def get_summary_stats(self) -> Dict[str, Any]:
         """
@@ -2355,8 +2711,9 @@ class TemporalAnalyzer:
         num_users: int = len(self.user_list)
         num_periods: int = len(self.df_resampled)
         avg_online_val: float = self.df_resampled.sum(axis=0).mean()
-        avg_online_periods: float = round(avg_online_val, 2) if not pd.isna(avg_online_val) else 0.0
-
+        avg_online_periods: float = (
+            round(avg_online_val, 2) if not pd.isna(avg_online_val) else 0.0
+        )
 
         total_duration_str: str = "N/A"
         # Use cached frequency for calculations
@@ -2381,8 +2738,7 @@ class TemporalAnalyzer:
             )
             if num_periods == 1:
                 total_duration_str = (
-                    f"{days}d {hours}h {minutes}m "
-                    f"(single period: {freq_str_repr})"
+                    f"{days}d {hours}h {minutes}m " f"(single period: {freq_str_repr})"
                 )
             else:
                 total_duration_str = f"{days}d {hours}h {minutes}m"
@@ -2390,9 +2746,7 @@ class TemporalAnalyzer:
         elif num_periods > 0:  # Freq unknown but data exists
             min_ts = self.df_resampled.index.min().strftime("%Y-%m-%d %H:%M")
             max_ts = self.df_resampled.index.max().strftime("%Y-%m-%d %H:%M")
-            total_duration_str = (
-                f"Approx. from {min_ts} to {max_ts} (freq unknown)"
-            )
+            total_duration_str = f"Approx. from {min_ts} to {max_ts} (freq unknown)"
 
         summary: Dict[str, Any] = {
             "num_users": num_users,
@@ -2400,19 +2754,18 @@ class TemporalAnalyzer:
             "avg_online_periods_per_user": avg_online_periods,
             "total_duration_analyzed": total_duration_str,
         }
-        tui.tui_print_info(f"Summary Statistics: {summary}")
+        logger.info("Summary Statistics: %s", summary)
         return summary
-
 
     def _calculate_jaccard_indices(self) -> pd.DataFrame:
         """
         Calculates Jaccard index matrix between users' online sessions.
-        
+
         Returns:
             A pandas DataFrame representing the Jaccard index matrix.
         """
         if self.df_resampled.empty or len(self.df_resampled.columns) < 2:
-            tui.tui_print_warning(
+            logger.warning(
                 "Not enough data or users to calculate Jaccard indices."
             )
             return pd.DataFrame()
@@ -2432,16 +2785,14 @@ class TemporalAnalyzer:
 
         # Avoid division by zero; where union==0, set jaccard to 0
         with np.errstate(divide="ignore", invalid="ignore"):
-            jaccard_arr: np.ndarray = np.where(
-                unions > 0, intersections / unions, 0.0
-            )
+            jaccard_arr: np.ndarray = np.where(unions > 0, intersections / unions, 0.0)
 
         # Ensure diagonal is exactly 1.0 when a user has any online activity, else 0.0
         diag_values = np.where(sums > 0, 1.0, 0.0)
         np.fill_diagonal(jaccard_arr, diag_values)
 
         jaccard_df = pd.DataFrame(jaccard_arr, index=users, columns=users, dtype=float)
-        tui.tui_print_info("Jaccard index matrix calculated (vectorized).")
+        logger.info("Jaccard index matrix calculated (vectorized).")
         return jaccard_df
 
     # ---- Binary metrics: MCC, Cohen's kappa, Ochiai, Overlap ----
@@ -2467,9 +2818,15 @@ class TemporalAnalyzer:
         # Block-bootstrap alternative
         if isinstance(method, str) and method.lower() in ("block", "bootstrap", "boot"):
             B = max(50, int(folds) * 50) if folds else 100
-            return self.stability_matrix_block(residualize=residualize, min_abs=float(min_abs), B=B, p_block=0.1)
+            return self.stability_matrix_block(
+                residualize=residualize, min_abs=float(min_abs), B=B, p_block=0.1
+            )
         folds = max(2, min(6, int(folds)))
-        frame = self.df_resid if (residualize and getattr(self, 'df_resid', None) is not None) else self.df_for_corr
+        frame = (
+            self.df_resid
+            if (residualize and getattr(self, "df_resid", None) is not None)
+            else self.df_for_corr
+        )
         if frame is None or frame.empty or frame.shape[1] < 2:
             return pd.DataFrame()
         users = list(frame.columns)
@@ -2485,13 +2842,17 @@ class TemporalAnalyzer:
             bounds.append(bounds[-1] + s)
         mats: List[pd.DataFrame] = []
         for k in range(folds):
-            a, b = bounds[k], bounds[k+1]
+            a, b = bounds[k], bounds[k + 1]
             sub = frame.iloc[a:b]
             if sub.shape[0] < 3:
                 # degenerate; use zeros
-                mats.append(pd.DataFrame(np.zeros((len(users), len(users))), index=users, columns=users))
+                mats.append(
+                    pd.DataFrame(
+                        np.zeros((len(users), len(users))), index=users, columns=users
+                    )
+                )
             else:
-                mats.append(sub.corr(method='spearman'))
+                mats.append(sub.corr(method="spearman"))
         # aggregate
         stab = np.zeros((len(users), len(users)), dtype=float)
         sign_votes = np.zeros((len(users), len(users)), dtype=float)
@@ -2511,7 +2872,9 @@ class TemporalAnalyzer:
         return stab_df
 
     @staticmethod
-    def _stationary_bootstrap_indices(T: int, p: float = 0.1, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    def _stationary_bootstrap_indices(
+        T: int, p: float = 0.1, rng: Optional[np.random.Generator] = None
+    ) -> np.ndarray:
         if rng is None:
             rng = np.random.default_rng()
         if T <= 1:
@@ -2540,7 +2903,11 @@ class TemporalAnalyzer:
         Returns fraction of resamples where |rho| >= min_abs.
         """
         rng = np.random.default_rng(random_state)
-        frame = self.df_resid if (residualize and getattr(self, 'df_resid', None) is not None) else self.df_for_corr
+        frame = (
+            self.df_resid
+            if (residualize and getattr(self, "df_resid", None) is not None)
+            else self.df_for_corr
+        )
         if frame is None or frame.empty or frame.shape[1] < 2:
             return pd.DataFrame()
         users = list(frame.columns)
@@ -2548,11 +2915,13 @@ class TemporalAnalyzer:
         T = len(frame.index)
         # cache
         try:
-            fp = self._frame_fingerprint(frame, 'resid' if residualize else 'for_corr')
+            fp = self._frame_fingerprint(frame, "resid" if residualize else "for_corr")
             key = f"tgtrax:stab_block:{khash(min_abs, B, p_block, residualize, random_state, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
-                return pd.DataFrame(cached['S'], index=users, columns=users, dtype=float)
+                return pd.DataFrame(
+                    cached["S"], index=users, columns=users, dtype=float
+                )
         except Exception:
             pass
         stats = np.zeros((n, n), dtype=float)
@@ -2561,17 +2930,17 @@ class TemporalAnalyzer:
             idx = self._stationary_bootstrap_indices(T, p=float(p_block), rng=rng)
             sub = frame.iloc[idx]
             try:
-                R = sub.corr(method='spearman').to_numpy()
+                R = sub.corr(method="spearman").to_numpy()
             except Exception:
                 R = np.zeros((n, n), dtype=float)
             mask = np.abs(R) >= float(min_abs)
             stats += mask.astype(float)
             counts += 1
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             S = np.divide(stats, counts, out=np.zeros_like(stats), where=counts > 0)
         out = pd.DataFrame(S, index=users, columns=users, dtype=float)
         try:
-            cache_set(key, {"S": S}, ttl=default_ttl('medium'))
+            cache_set(key, {"S": S}, ttl=default_ttl("medium"))
         except Exception:
             pass
         return out
@@ -2598,13 +2967,13 @@ class TemporalAnalyzer:
         # cache
         try:
             users = list(dfb.columns)
-            fp = self._frame_fingerprint(dfb, 'binary')
+            fp = self._frame_fingerprint(dfb, "binary")
             key = f"tgtrax:jaccard_perm:{khash(perms, fdr_method, random_state, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
-                    pd.DataFrame(cached['p'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["p"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
@@ -2613,7 +2982,7 @@ class TemporalAnalyzer:
         sums = X.sum(axis=0)
         inter = X.T @ X
         unions = sums[:, None] + sums[None, :] - inter
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             J_obs = np.where(unions > 0, inter / unions, 0.0)
         rng = np.random.default_rng(random_state)
         ge = np.zeros((n, n), dtype=float)
@@ -2623,7 +2992,7 @@ class TemporalAnalyzer:
             sums_s = Xs.sum(axis=0)
             inter_s = Xs.T @ X
             unions_s = sums_s[:, None] + sums[None, :] - inter_s
-            with np.errstate(divide='ignore', invalid='ignore'):
+            with np.errstate(divide="ignore", invalid="ignore"):
                 J_b = np.where(unions_s > 0, inter_s / unions_s, 0.0)
             ge += (J_b >= J_obs).astype(float)
         pvals = (ge + 1.0) / float(perms + 1)
@@ -2643,7 +3012,7 @@ class TemporalAnalyzer:
             pd.DataFrame(qvals, index=users, columns=users, dtype=float),
         )
         try:
-            cache_set(key, {"p": pvals, "q": qvals}, ttl=default_ttl('heavy'))
+            cache_set(key, {"p": pvals, "q": qvals}, ttl=default_ttl("heavy"))
         except Exception:
             pass
         return out
@@ -2663,7 +3032,7 @@ class TemporalAnalyzer:
         c00 = T - a[:, None] - b[None, :] + c11
         num = (c11 * c00) - (c10 * c01)
         denom = a[:, None] * b[None, :] * (T - a)[:, None] * (T - b)[None, :]
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             M = np.where(denom <= 0, 0.0, num / np.sqrt(denom))
         # clamp
         M = np.clip(M, -1.0, 1.0)
@@ -2683,9 +3052,11 @@ class TemporalAnalyzer:
         c01 = b[None, :] - c11
         c00 = T - a[:, None] - b[None, :] + c11
         p_o = (c11 + c00) / float(T)
-        p_e = ((a / T)[:, None] * (b / T)[None, :]) + (((T - a) / T)[:, None] * ((T - b) / T)[None, :])
+        p_e = ((a / T)[:, None] * (b / T)[None, :]) + (
+            ((T - a) / T)[:, None] * ((T - b) / T)[None, :]
+        )
         denom = 1.0 - p_e
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             K = np.where(np.abs(denom) < 1e-12, 0.0, (p_o - p_e) / denom)
         return pd.DataFrame(K, index=users, columns=users, dtype=float)
 
@@ -2698,7 +3069,7 @@ class TemporalAnalyzer:
         c11 = X.T @ X
         a = X.sum(axis=0)
         denom = np.sqrt(np.outer(a, a))
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             V = np.where(denom > 0, c11 / denom, 0.0)
         return pd.DataFrame(V, index=users, columns=users, dtype=float)
 
@@ -2711,7 +3082,7 @@ class TemporalAnalyzer:
         c11 = X.T @ X
         a = X.sum(axis=0)
         denom = np.minimum(a[:, None], a[None, :])
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             V = np.where(denom > 0, c11 / denom, 0.0)
         return pd.DataFrame(V, index=users, columns=users, dtype=float)
 
@@ -2770,13 +3141,13 @@ class TemporalAnalyzer:
             return pd.DataFrame(), pd.DataFrame()
         users = list(E.columns)
         try:
-            fp = self._frame_fingerprint(self._binary_frame(), 'binary')
+            fp = self._frame_fingerprint(self._binary_frame(), "binary")
             key = f"tgtrax:esi_perm:{khash(tau_seconds, perms, random_state, fdr_method, tuple(users), fp)}"
             cached = cache_get(key)
             if cached:
                 return (
-                    pd.DataFrame(cached['p'], index=users, columns=users, dtype=float),
-                    pd.DataFrame(cached['q'], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["p"], index=users, columns=users, dtype=float),
+                    pd.DataFrame(cached["q"], index=users, columns=users, dtype=float),
                 )
         except Exception:
             pass
@@ -2788,21 +3159,28 @@ class TemporalAnalyzer:
         for u in users:
             s = dfb[u].values
             ev_idx[u] = np.where((s[1:] > s[:-1]))[0] + 1
-        tau_steps = max(0, int(round(tau_seconds / float(self.resample_seconds or 60.0))))
+        tau_steps = max(
+            0, int(round(tau_seconds / float(self.resample_seconds or 60.0)))
+        )
         rng = np.random.default_rng(random_state)
         P = np.full((n, n), np.nan, dtype=float)
         T = len(self.df_resampled.index)
         for i in range(n):
             for j in range(i + 1, n):
-                A = ev_idx[users[i]]; B = ev_idx[users[j]]
+                A = ev_idx[users[i]]
+                B = ev_idx[users[j]]
                 if len(A) == 0 or len(B) == 0:
                     continue
                 # observed ESI
-                ai = bi = 0; matches = 0
+                ai = bi = 0
+                matches = 0
                 while ai < len(A) and bi < len(B):
-                    da = A[ai]; db = B[bi]
+                    da = A[ai]
+                    db = B[bi]
                     if abs(da - db) <= tau_steps:
-                        matches += 1; ai += 1; bi += 1
+                        matches += 1
+                        ai += 1
+                        bi += 1
                     elif da < db:
                         ai += 1
                     else:
@@ -2813,11 +3191,15 @@ class TemporalAnalyzer:
                     sft = int(rng.integers(0, T))
                     B_s = (B + sft) % T
                     B_s.sort()
-                    ai = bi = 0; matches_b = 0
+                    ai = bi = 0
+                    matches_b = 0
                     while ai < len(A) and bi < len(B_s):
-                        da = A[ai]; db = B_s[bi]
+                        da = A[ai]
+                        db = B_s[bi]
                         if abs(da - db) <= tau_steps:
-                            matches_b += 1; ai += 1; bi += 1
+                            matches_b += 1
+                            ai += 1
+                            bi += 1
                         elif da < db:
                             ai += 1
                         else:
@@ -2829,7 +3211,11 @@ class TemporalAnalyzer:
                 P[i, j] = P[j, i] = p
         iu = np.triu_indices(n, k=1)
         pvec = P[iu]
-        qvec = self._by_fdr(pvec) if (fdr_method or 'by').lower() == 'by' else self._bh_fdr(pvec)
+        qvec = (
+            self._by_fdr(pvec)
+            if (fdr_method or "by").lower() == "by"
+            else self._bh_fdr(pvec)
+        )
         Q = np.full_like(P, np.nan, dtype=float)
         Q[iu] = qvec
         Q = Q + Q.T
@@ -2838,11 +3224,10 @@ class TemporalAnalyzer:
         outp = pd.DataFrame(P, index=users, columns=users, dtype=float)
         outq = pd.DataFrame(Q, index=users, columns=users, dtype=float)
         try:
-            cache_set(key, {"p": P, "q": Q}, ttl=default_ttl('heavy'))
+            cache_set(key, {"p": P, "q": Q}, ttl=default_ttl("heavy"))
         except Exception:
             pass
         return (outp, outq)
-
 
     def get_jaccard_matrix(self) -> pd.DataFrame:
         """
@@ -2852,7 +3237,6 @@ class TemporalAnalyzer:
             A pandas DataFrame with user-to-user Jaccard indices.
         """
         return self.jaccard_matrix
-
 
     def get_significant_jaccard_pairs(
         self, threshold: Optional[float] = None
@@ -2870,9 +3254,7 @@ class TemporalAnalyzer:
             The list is sorted by the Jaccard index in descending order.
         """
         current_threshold: float = (
-            threshold
-            if threshold is not None
-            else self.default_jaccard_threshold
+            threshold if threshold is not None else self.default_jaccard_threshold
         )
 
         if self.jaccard_matrix.empty:
@@ -2892,20 +3274,21 @@ class TemporalAnalyzer:
                     significant_pairs.append(((user1, user2), jaccard_value))
 
         significant_pairs.sort(key=lambda x: x[1], reverse=True)
-        tui.tui_print_info(
-            f"Found {len(significant_pairs)} significant Jaccard pairs "
-            f"with threshold >= {current_threshold:.2f}"
+        logger.info(
+            "Found %s significant Jaccard pairs with threshold >= %.2f",
+            len(significant_pairs),
+            current_threshold,
         )
         return significant_pairs
 
 
-
 # --- Helper Functions ---
+
 
 def create_activity_gantt_chart(
     activity_intervals: Dict[str, List[Dict[str, Any]]],
     title: str = "User Activity Gantt Chart",
-) -> Union[Any, None]: # Plotly figure type is not standard, use Any
+) -> Union[Any, None]:  # Plotly figure type is not standard, use Any
     """
     Generates a Plotly Gantt chart from activity intervals.
 
@@ -2921,12 +3304,12 @@ def create_activity_gantt_chart(
     """
     try:
         import plotly.figure_factory as ff
-        import plotly.io as pio # For potential saving, not used directly here for display
+        import plotly.io as pio  # For potential saving, not used directly here for display
+
         # pio.templates.default = "plotly_dark" # Optional: theme
     except ImportError:
-        tui.tui_print_warning(
-            "Plotly is not installed. Cannot generate Gantt chart. "
-            "Please install with `pip install plotly`."
+        logger.warning(
+            "Plotly is not installed. Cannot generate Gantt chart. Please install with `pip install plotly`."
         )
         return None
 
@@ -2935,27 +3318,27 @@ def create_activity_gantt_chart(
         df_tasks.extend(user_intervals)
 
     if not df_tasks:
-        tui.tui_print_info("No data available to generate Gantt chart.")
+        logger.info("No data available to generate Gantt chart.")
         return None
 
     colors: Dict[str, str] = {
         "Online": "rgb(0, 200, 0)",  # Green
-        "Offline": "rgb(220, 0, 0)", # Red
+        "Offline": "rgb(220, 0, 0)",  # Red
     }
 
     try:
         fig = ff.create_gantt(
             df_tasks,
             colors=colors,
-            index_col="Resource", # \'Online\' or \'Offline\'
+            index_col="Resource",  # \'Online\' or \'Offline\'
             show_colorbar=True,
-            group_tasks=True,    # Groups by \'Task\' (username)
+            group_tasks=True,  # Groups by \'Task\' (username)
             title=title,
         )
         fig.update_layout(xaxis_title="Time", yaxis_title="User")
-        tui.tui_print_info(
-            f"Gantt chart \'{title}\' created. "
-            "Display with fig.show() or save externally."
+        logger.info(
+            "Gantt chart '%s' created. Display with fig.show() or save externally.",
+            title,
         )
         # Example save:
         # chart_filename = title.lower().replace(' ', '_') + ".html"
@@ -2963,15 +3346,14 @@ def create_activity_gantt_chart(
         # tui.tui_print_info(f"Gantt chart saved to {chart_filename}")
         return fig
     except Exception as e:
-        tui.tui_print_error(f"Error creating Gantt chart: {e}")
+        logger.error("Error creating Gantt chart: %s", e)
         return None
-
 
 
 # --- Main Execution Block (for testing and demonstration) ---
 
 if __name__ == "__main__":
-    tui.tui_print_highlight("Testing TemporalAnalyzer module...")
+    logger.info("Testing TemporalAnalyzer module...")
 
     # Dummy data setup
     date_rng = pd.date_range(
@@ -2982,82 +3364,257 @@ if __name__ == "__main__":
     )
     data_payload = {
         "Alice": [
-            1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1,
-            1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1,
-            0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
         ],
         "Bob": [
-            0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1,
-            0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1,
-            1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
         ],
         "Charlie": [
-            1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0,
-            1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0,
-            0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            1,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            0,
+            1,
         ],
     }
     df_activity_test = pd.DataFrame(data_payload, index=date_rng).astype(bool)
 
-    tui.tui_print_info("Initializing TemporalAnalyzer with dummy data...")
+    logger.info("Initializing TemporalAnalyzer with dummy data...")
     analyzer = TemporalAnalyzer(
         df_activity_test, resample_period="2T", correlation_threshold=0.3
     )
 
-    tui.tui_print_info("\\n--- Correlation Matrix ---")
+    logger.info("\\n--- Correlation Matrix ---")
     corr_matrix_test = analyzer.get_correlation_matrix()
     if not corr_matrix_test.empty:
-        tui.tui_print_code(
-            corr_matrix_test.to_string(), language="text", title="Correlation Matrix"
-        )
+        logger.debug(corr_matrix_test.to_string())
     else:
-        tui.tui_print_warning("Correlation matrix is empty.")
+        logger.warning("Correlation matrix is empty.")
 
-    tui.tui_print_info("\\n--- Significant Pairs (threshold from init) ---")
+    logger.info("\\n--- Significant Pairs (threshold from init) ---")
     sig_pairs_default_test = analyzer.get_significant_pairs()
     if sig_pairs_default_test:
         for pair, corr_val in sig_pairs_default_test:
-            tui.tui_print_info(f"  {pair}: {corr_val:.3f}")
+            logger.info(f"  {pair}: {corr_val:.3f}")
     else:
-        tui.tui_print_warning("No significant pairs found with default threshold.")
+        logger.warning("No significant pairs found with default threshold.")
 
-    tui.tui_print_info("\\n--- Significant Pairs (threshold override 0.1) ---")
+    logger.info("\\n--- Significant Pairs (threshold override 0.1) ---")
     sig_pairs_override_test = analyzer.get_significant_pairs(threshold=0.1)
     if sig_pairs_override_test:
         for pair, corr_val in sig_pairs_override_test:
-            tui.tui_print_info(f"  {pair}: {corr_val:.3f}")
+            logger.info(f"  {pair}: {corr_val:.3f}")
     else:
-        tui.tui_print_warning(
+        logger.warning(
             "No significant pairs found with overridden threshold 0.1."
         )
 
-    tui.tui_print_info("\\n--- Building Correlation Graph (threshold from init) ---")
+    logger.info("\\n--- Building Correlation Graph (threshold from init) ---")
     graph_test = analyzer.build_correlation_graph()
     if graph_test.nodes():
-        tui.tui_print_info(
+        logger.info(
             f"  Graph nodes: {graph_test.number_of_nodes()}, "
             f"edges: {graph_test.number_of_edges()}"
         )
         if graph_test.edges():
-            tui.tui_print_info("  Communities:")
+            logger.info("  Communities:")
             communities_test = analyzer.get_communities(graph=graph_test)
             for comm_id, users_in_comm in communities_test.items():
-                tui.tui_print_info(f"    Community {comm_id}: {users_in_comm}")
+                logger.info(f"    Community {comm_id}: {users_in_comm}")
     else:
-        tui.tui_print_warning("Graph is empty.")
+        logger.warning("Graph is empty.")
 
-    tui.tui_print_info("\\n--- Users Sorted by Correlation ---")
+    logger.info("\\n--- Users Sorted by Correlation ---")
     sorted_users_test = analyzer.get_users_sorted_by_correlation(top_n=5)
-    tui.tui_print_info(f"  Top 5 correlated users: {sorted_users_test}")
+    logger.info(f"  Top 5 correlated users: {sorted_users_test}")
 
-    tui.tui_print_info("\\n--- Activity Intervals (for Gantt) ---")
+    logger.info("\\n--- Activity Intervals (for Gantt) ---")
     activity_intervals_data_test = analyzer.get_activity_intervals()
-    if "Alice" in activity_intervals_data_test and activity_intervals_data_test["Alice"]:
-        tui.tui_print_info("Sample intervals for Alice:")
+    if (
+        "Alice" in activity_intervals_data_test
+        and activity_intervals_data_test["Alice"]
+    ):
+        logger.info("Sample intervals for Alice:")
         for interval in activity_intervals_data_test["Alice"][:3]:
             start_str = interval["Start"].strftime("%Y-%m-%d %H:%M:%S")
             finish_str = interval["Finish"].strftime("%Y-%m-%d %H:%M:%S")
-            tui.tui_print_info(
+            logger.info(
                 f"  Start: {start_str}, Finish: {finish_str}, "
                 f"Resource: {interval['Resource']}"
             )
@@ -3067,13 +3624,11 @@ if __name__ == "__main__":
         # if gantt_fig_test:
         #     pass # fig.show() or save
     else:
-        tui.tui_print_warning(
-            "No activity intervals found for Alice or data is empty."
-        )
+        logger.warning("No activity intervals found for Alice or data is empty.")
 
-    tui.tui_print_info("\\n--- Summary Stats ---")
+    logger.info("\\n--- Summary Stats ---")
     summary_test = analyzer.get_summary_stats()
     for key, value in summary_test.items():
-        tui.tui_print_info(f"  {key.replace('_',' ').capitalize()}: {value}")
+        logger.info(f"  {key.replace('_',' ').capitalize()}: {value}")
 
-    tui.tui_print_success("\\nTemporalAnalyzer tests completed.") 
+    logger.info("\\nTemporalAnalyzer tests completed.")

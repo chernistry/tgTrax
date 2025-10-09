@@ -1,14 +1,19 @@
 # ==== TELEGRAM ACTIVITY TRACKER MODULE ==== #
-# Description: This module is responsible for tracking user activity on Telegram.
-#              It connects to Telegram, monitors specified users for online/offline
-#              status changes, and records these activities into a database.
-#              It uses both event-based updates and periodic polling for robustness.
+"""
+Track Telegram user activity and persist events.
 
+Overview:
+- Connects to Telegram via Telethon.
+- Monitors online/offline status for target usernames.
+- Records activity into SQLite using the `SQLiteDatabase` helper.
+- Uses real-time events and periodic polling for robustness.
+"""
 
 import asyncio
+import logging
 import datetime
 import os
-import time # For sleep in main loop
+import time
 from typing import List, Dict, Optional, Any, Union, Tuple
 
 import pandas as pd
@@ -24,19 +29,13 @@ from telethon.tl.types import (
 )
 
 from tgTrax.core.database import SQLiteDatabase
-from tgTrax.utils import tui
-from tgTrax.utils.logger_adapter import TuiLoggerAdapter
+ 
 
 
-# --- Type Aliases ---
-# For complex Telethon types if needed, e.g.:
-# TelegramUserStatus: TypeAlias = Union[UserStatusOnline, UserStatusOffline, UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth, None]
+# --► GLOBAL CONFIGURATION & CONSTANTS
+logger = logging.getLogger(__name__)
 
-
-# --- Constants & Global Configuration ---
-logger = TuiLoggerAdapter(tui) # Global logger instance
-
-load_dotenv() # Load environment variables from .env file
+load_dotenv()
 
 # Telegram API Credentials (from .env)
 TELEGRAM_API_ID_STR: Optional[str] = os.getenv("TELEGRAM_API_ID")
@@ -45,9 +44,9 @@ TELEGRAM_API_ID: Optional[int] = None
 
 if not TELEGRAM_API_ID_STR or not TELEGRAM_API_HASH:
     logger.error(
-        "Critical: TELEGRAM_API_ID or TELEGRAM_API_HASH not found in .env or environment."
+        "Critical: TELEGRAM_API_ID or TELEGRAM_API_HASH not found in .env "
+        "or environment."
     )
-    # Application might fail later if these are strictly required by TelegramClient
 else:
     try:
         TELEGRAM_API_ID = int(TELEGRAM_API_ID_STR)
@@ -55,15 +54,13 @@ else:
         logger.error("Critical: TELEGRAM_API_ID must be an integer.")
 
 # Project paths
-# Assuming this script (tracker.py) is in tgTrax/core/
-# PROJECT_ROOT will then be tgTrax/
 PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SESSIONS_DIR: str = os.path.join(PROJECT_ROOT, "sessions")
+
 if not os.path.exists(SESSIONS_DIR):
     os.makedirs(SESSIONS_DIR)
-    tui.tui_print_info(f"Created sessions directory: {SESSIONS_DIR}")
+    logger.info("Created sessions directory: %s", SESSIONS_DIR)
 
-# Unify session with CLI/API: use TELEGRAM_SESSION_NAME (default 'tgTrax_session')
 SESSION_BASENAME = os.getenv("TELEGRAM_SESSION_NAME", "tgTrax_session")
 SESSION_NAME_DEFAULT: str = os.path.join(SESSIONS_DIR, SESSION_BASENAME)
 
@@ -78,7 +75,7 @@ MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS: int = int(
 # Debugging: List of usernames for verbose status logging
 TARGET_DEBUG_USERS: List[str] = [
     "user_one",
-    "user_two",
+    "user_two", 
     "user_three",
     "user_four",
     "user_five",
@@ -86,7 +83,9 @@ TARGET_DEBUG_USERS: List[str] = [
 ]
 
 
-# --- CorrelationTracker Class ---
+
+# ==== CORRELATION TRACKER CLASS ==== #
+
 class CorrelationTracker:
     """
     Tracks Telegram user activity by monitoring online/offline status.
@@ -103,11 +102,11 @@ class CorrelationTracker:
         session_name: str = SESSION_NAME_DEFAULT,
     ) -> None:
         """
-        Initializes the CorrelationTracker.
+        Initialize the tracker with targets, database, and session path.
 
         Args:
             target_usernames: A list of Telegram @usernames to track.
-                              The \'@\' prefix will be stripped if present.
+                              The '@' prefix will be stripped if present.
             db_path: Path to the SQLite database file. If relative, it will be
                      resolved relative to the project root (tgTrax directory).
             session_name: Path to the Telethon session file.
@@ -123,17 +122,16 @@ class CorrelationTracker:
             self.db_path: str = db_path
         
         self.db: SQLiteDatabase = SQLiteDatabase(self.db_path)
-        tui.tui_print_info(f"Database initialized at: {self.db_path}")
+        logger.info("Database initialized at: %s", self.db_path)
 
         self.session_name: str = session_name
         self.client: Optional[TelegramClient] = None
-        self.user_id_map: Dict[int, str] = {} # user_id -> username
+        self.user_id_map: Dict[int, str] = {}
         self.polling_task: Optional[asyncio.Task[None]] = None
-        # Lazily create asyncio.Event when an event loop exists (e.g., in start_tracking).
-        # In threads without an event loop (e.g., Flask worker threads), constructing
-        # asyncio.Event at __init__ time raises: "There is no current event loop".
+        
+        # Lazily create asyncio.Event when an event loop exists
         self.shutdown_event: Optional[asyncio.Event] = None
-        self.is_running: bool = False # Controls main loops, set True in start_tracking
+        self.is_running: bool = False
         self._handler_registered: bool = False
 
         if TELEGRAM_API_ID is None or TELEGRAM_API_HASH is None:
@@ -145,7 +143,7 @@ class CorrelationTracker:
 
     def _initialize_client(self) -> None:
         """
-        Initializes the Telethon client if it hasn\'t been already.
+        Initialize the Telethon client if not already present.
 
         Raises:
             ValueError: If TELEGRAM_API_ID or TELEGRAM_API_HASH is not configured.
@@ -154,17 +152,20 @@ class CorrelationTracker:
             return
 
         if TELEGRAM_API_ID is None or TELEGRAM_API_HASH is None:
-            err_msg = "Cannot initialize TelegramClient: API_ID or API_HASH is missing/invalid."
+            err_msg = (
+                "Cannot initialize TelegramClient: API_ID or API_HASH is "
+                "missing/invalid."
+            )
             logger.error(err_msg)
             raise ValueError(err_msg)
 
-        tui.tui_print_debug("Initializing TelethonClient...")
+        logger.debug("Initializing TelethonClient...")
         self.client = TelegramClient(
             self.session_name,
             TELEGRAM_API_ID,
             TELEGRAM_API_HASH,
-            connection_retries=None,  # Retry indefinitely
-            retry_delay=5,            # Delay between retries (seconds)
+            connection_retries=None,
+            retry_delay=5,
         )
 
 
@@ -188,14 +189,15 @@ class CorrelationTracker:
         assert self.client is not None, "Client should be initialized here"
 
         if not self.client.is_connected():
-            tui.tui_print_info(f"Connecting to Telegram with session: {self.session_name}...")
+            logger.info("Connecting to Telegram with session: %s...", self.session_name)
             try:
                 await self.client.connect()
                 if not await self.client.is_user_authorized():
-                    tui.tui_print_info("Client is not authorized. Attempting to sign in...")
-                    tui.tui_print_highlight(
-                        "If this is the first run or session is invalid, you may be "
-                        "prompted for your phone number and login code (and 2FA password)."
+                    logger.info(
+                        "Client is not authorized. Attempting to sign in..."
+                    )
+                    logger.info(
+                        "If this is the first run or session is invalid, prompts may occur for phone/code/2FA."
                     )
                     # Telethon's client.start() handles interactive login for phone, code, 2FA.
                     await self.client.start()
@@ -204,15 +206,18 @@ class CorrelationTracker:
                             "Client authorization failed. Please check credentials/2FA."
                         )
                         raise ConnectionRefusedError("Telegram client authorization failed.")
-                    tui.tui_print_success("Client authorized successfully.")
+                    logger.info("Client authorized successfully.")
                 
                 me: Optional[User] = await self.client.get_me()
                 if me:
-                    tui.tui_print_info(
-                        f"Client connection confirmed. Logged in as: {me.username or me.id}"
+                    logger.info(
+                        "Client connection confirmed. Logged in as: %s",
+                        me.username or me.id,
                     )
                 else: # Should ideally not happen if authorized
-                    tui.tui_print_warning("Client connected and authorized, but get_me() returned None.")
+                    logger.warning(
+                        "Client connected and authorized, but get_me() returned None."
+                    )
 
             except ( # Specific, potentially recoverable errors first
                 errors.PhoneNumberInvalidError,
@@ -238,7 +243,7 @@ class CorrelationTracker:
         Handles common errors during entity resolution like non-existent users or flood waits.
         """
         if not self.target_usernames:
-            tui.tui_print_warning("No target usernames provided for tracking.")
+            logger.warning("No target usernames provided for tracking.")
             return
 
         await self._ensure_client_connected()
@@ -247,20 +252,25 @@ class CorrelationTracker:
         resolved_count = 0
         for username_to_resolve in self.target_usernames:
             if self._shutdown_is_set():
-                tui.tui_print_info("Shutdown initiated, stopping user resolution.")
+                logger.info("Shutdown initiated, stopping user resolution.")
                 break
             try:
-                tui.tui_print_debug(f"Attempting to resolve @{username_to_resolve}...")
+                logger.debug("Attempting to resolve @%s...", username_to_resolve)
                 entity: User = await self.client.get_entity(username_to_resolve) # type: ignore
                 # Ensure entity is a User and not Channel, etc. before accessing .username and .id
                 if hasattr(entity, 'username') and hasattr(entity, 'id'):
                     self.user_id_map[entity.id] = entity.username # type: ignore
-                    tui.tui_print_success(
-                        f"Successfully resolved @{entity.username} to ID {entity.id}" # type: ignore
+                    logger.info(
+                        "Successfully resolved @%s to ID %s",
+                        entity.username,  # type: ignore
+                        entity.id,
                     )
                     resolved_count += 1
                 else:
-                    tui.tui_print_warning(f"Resolved entity for @{username_to_resolve} is not a standard user type or lacks expected attributes. Skipping.")
+                    logger.warning(
+                        "Resolved entity for @%s is not a standard user type or lacks expected attributes. Skipping.",
+                        username_to_resolve,
+                    )
 
             except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
                 logger.error(f"Username @{username_to_resolve} not found or invalid. Skipping.")
@@ -274,7 +284,7 @@ class CorrelationTracker:
                 try:
                     await asyncio.sleep(e_flood.seconds)
                 except asyncio.CancelledError:
-                    tui.tui_print_info("User resolution sleep interrupted by shutdown.")
+                    logger.info("User resolution sleep interrupted by shutdown.")
                     break
             except (errors.RPCError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e_net:
                 logger.error(
@@ -295,9 +305,11 @@ class CorrelationTracker:
         if not self.user_id_map:
             logger.warning("Could not resolve any target usernames.")
         else:
-            tui.tui_print_info(
-                f"Successfully resolved {resolved_count}/{len(self.target_usernames)} users. "
-                f"Tracking: {list(self.user_id_map.values())}"
+            logger.info(
+                "Successfully resolved %s/%s users. Tracking: %s",
+                resolved_count,
+                len(self.target_usernames),
+                list(self.user_id_map.values()),
             )
 
 
@@ -325,17 +337,23 @@ class CorrelationTracker:
         assumed_online_timestamp_ms: Optional[int] = None
 
         if username in TARGET_DEBUG_USERS:
-            tui.tui_print_debug(
-                f"[{source}] Processing status for {username} (ID: {user_id}). "
-                f"Raw status: {status_obj!r}"
+            logger.debug(
+                "[%s] Processing status for %s (ID: %s). Raw status: %r",
+                source,
+                username,
+                user_id,
+                status_obj,
             )
 
         if isinstance(status_obj, UserStatusOnline):
             is_online = True
             current_event_time = datetime.datetime.now(datetime.timezone.utc)
-            tui.tui_print_info(
-                f"[{source}] User {username} (ID: {user_id}) is ONLINE. "
-                f"Timestamp: {current_event_time.isoformat()}"
+            logger.info(
+                "[%s] User %s (ID: %s) is ONLINE. Timestamp: %s",
+                source,
+                username,
+                user_id,
+                current_event_time.isoformat(),
             )
         elif isinstance(status_obj, UserStatusOffline):
             is_online = False
@@ -345,9 +363,12 @@ class CorrelationTracker:
                 if current_event_time.tzinfo is None:
                     current_event_time = current_event_time.replace(tzinfo=datetime.timezone.utc)
                 
-                tui.tui_print_debug(
-                    f"[{source}] User {username} (ID: {user_id}) is OFFLINE. "
-                    f"Last seen: {current_event_time.isoformat()}"
+                logger.debug(
+                    "[%s] User %s (ID: %s) is OFFLINE. Last seen: %s",
+                    source,
+                    username,
+                    user_id,
+                    current_event_time.isoformat(),
                 )
                 if MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS > 0:
                     assumed_online_start_time = current_event_time - datetime.timedelta(
@@ -356,39 +377,53 @@ class CorrelationTracker:
                     assumed_online_timestamp_ms = int(
                         assumed_online_start_time.timestamp() * 1000
                     )
-                    tui.tui_print_info(
-                        f"[{source}] {username} - inserting assumed online record at "
-                        f"{assumed_online_start_time.isoformat()} (due to was_online "
-                        f"at {current_event_time.isoformat()} and "
-                        f"MIN_ASSUMED_ONLINE_DUR={MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS}s)"
+                    logger.info(
+                        "[%s] %s - inserting assumed online record at %s (due to was_online at %s and MIN_ASSUMED_ONLINE_DUR=%ss)",
+                        source,
+                        username,
+                        assumed_online_start_time.isoformat(),
+                        current_event_time.isoformat(),
+                        MINIMUM_ASSUMED_ONLINE_DURATION_SECONDS,
                     )
             else:
                 current_event_time = datetime.datetime.now(datetime.timezone.utc)
-                tui.tui_print_warning(
-                    f"[{source}] User {username} (ID: {user_id}) is OFFLINE but no "
-                    f"was_online time. Using current time: {current_event_time.isoformat()}"
+                logger.warning(
+                    "[%s] User %s (ID: %s) is OFFLINE but no was_online time. Using current time: %s",
+                    source,
+                    username,
+                    user_id,
+                    current_event_time.isoformat(),
                 )
         elif isinstance(status_obj, (UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth)):
             is_online = False
             current_event_time = datetime.datetime.now(datetime.timezone.utc)
-            tui.tui_print_debug(
-                f"[{source}] User {username} (ID: {user_id}) status is "
-                f"{type(status_obj).__name__}. Marking as OFFLINE. "
-                f"Timestamp: {current_event_time.isoformat()}"
+            logger.debug(
+                "[%s] User %s (ID: %s) status is %s. Marking as OFFLINE. Timestamp: %s",
+                source,
+                username,
+                user_id,
+                type(status_obj).__name__,
+                current_event_time.isoformat(),
             )
         elif status_obj is None:
             is_online = False # Assume offline for None status (e.g. hidden)
             current_event_time = datetime.datetime.now(datetime.timezone.utc)
-            tui.tui_print_warning(
-                f"[{source}] User {username} (ID: {user_id}) has None status. "
-                f"Marking as OFFLINE. Timestamp: {current_event_time.isoformat()}"
+            logger.warning(
+                "[%s] User %s (ID: %s) has None status. Marking as OFFLINE. Timestamp: %s",
+                source,
+                username,
+                user_id,
+                current_event_time.isoformat(),
             )
         else:
             is_online = False # Default to offline for unhandled status types
             current_event_time = datetime.datetime.now(datetime.timezone.utc)
-            tui.tui_print_warning(
-                f"[{source}] Unhandled status type for {username} (ID: {user_id}): "
-                f"{type(status_obj).__name__}. Using current time, assuming OFFLINE."
+            logger.warning(
+                "[%s] Unhandled status type for %s (ID: %s): %s. Using current time, assuming OFFLINE.",
+                source,
+                username,
+                user_id,
+                type(status_obj).__name__,
             )
 
         # Ensure current_event_time is set and timezone-aware (should be by now)
@@ -420,32 +455,42 @@ class CorrelationTracker:
                 log_msg_db_prep += f", Assumed Online TS: {assumed_dt_utc.isoformat()}"
             final_dt_utc = datetime.datetime.fromtimestamp(timestamp_ms / 1000, tz=datetime.timezone.utc)
             log_msg_db_prep += f", Final TS for this record: {final_dt_utc.isoformat()}"
-            tui.tui_print_debug(log_msg_db_prep)
+            logger.debug(log_msg_db_prep)
 
         # Insert assumed online record if applicable
         if assumed_online_timestamp_ms is not None:
             if assumed_online_timestamp_ms >= timestamp_ms:
                 # Ensure assumed online is strictly before the offline record
-                tui.tui_print_warning(
-                    f"[{source}] {username} - Adjusting assumed online timestamp to be before offline. "
-                    f"Original assumed: {assumed_online_timestamp_ms}, final: {timestamp_ms}"
+                logger.warning(
+                    "[%s] %s - Adjusting assumed online timestamp to be before offline. Original assumed: %s, final: %s",
+                    source,
+                    username,
+                    assumed_online_timestamp_ms,
+                    timestamp_ms,
                 )
                 assumed_online_timestamp_ms = timestamp_ms - 1 
             self.db.insert_activity(username, assumed_online_timestamp_ms, True)
             assumed_log_dt_utc = datetime.datetime.fromtimestamp(
                 assumed_online_timestamp_ms / 1000, tz=datetime.timezone.utc
             )
-            tui.tui_print_debug(
-                f"[{source}] DB record for {username} (ID: {user_id}): "
-                f"Online (assumed) at {assumed_log_dt_utc.isoformat()}"
+            logger.debug(
+                "[%s] DB record for %s (ID: %s): Online (assumed) at %s",
+                source,
+                username,
+                user_id,
+                assumed_log_dt_utc.isoformat(),
             )
         
         # Insert the primary status record
         self.db.insert_activity(username, timestamp_ms, is_online)
         final_record_dt_utc = datetime.datetime.fromtimestamp(timestamp_ms / 1000, tz=datetime.timezone.utc)
-        tui.tui_print_debug(
-            f"[{source}] DB record for {username} (ID: {user_id}): "
-            f"{'Online' if is_online else 'Offline'} at {final_record_dt_utc.isoformat()}"
+        logger.debug(
+            "[%s] DB record for %s (ID: %s): %s at %s",
+            source,
+            username,
+            user_id,
+            "Online" if is_online else "Offline",
+            final_record_dt_utc.isoformat(),
         )
 
 
@@ -457,16 +502,18 @@ class CorrelationTracker:
             event: The `events.UserUpdate` object from Telethon.
         """
         if not hasattr(event, "user_id") or event.user_id is None:
-            tui.tui_print_debug(f"Received UserUpdate event without user_id: {event!r}")
+            logger.debug("Received UserUpdate event without user_id: %r", event)
             return
 
         user_id: int = event.user_id
         username: Optional[str] = self.user_id_map.get(user_id)
 
         if username:
-            tui.tui_print_debug(
-                f"Event received for tracked user: {username} (ID: {user_id}), "
-                f"event: {event!r}"
+            logger.debug(
+                "Event received for tracked user: %s (ID: %s), event: %r",
+                username,
+                user_id,
+                event,
             )
             
             status_obj: Any = None # Union[UserStatusOnline, ..., None]
@@ -480,9 +527,11 @@ class CorrelationTracker:
                     username, user_id, status_obj, source="event_handler"
                 )
             else:
-                tui.tui_print_warning(
-                    f"No status info (event.status/online) in UserUpdate for "
-                    f"{username} (ID: {user_id}): {event!r}. Cannot process."
+                logger.warning(
+                    "No status info (event.status/online) in UserUpdate for %s (ID: %s): %r. Cannot process.",
+                    username,
+                    user_id,
+                    event,
                 )
         else:
             # This is common for updates about non-tracked users; log once per id to reduce noise
@@ -490,8 +539,9 @@ class CorrelationTracker:
                 self._unknown_user_logged = set()
             if user_id not in self._unknown_user_logged:
                 self._unknown_user_logged.add(user_id)
-                tui.tui_print_debug(
-                    f"Received update for non-target user id={user_id}; suppressing further logs for this id"
+                logger.debug(
+                    "Received update for non-target user id=%s; suppressing further logs for this id",
+                    user_id,
                 )
 
 
@@ -504,66 +554,73 @@ class CorrelationTracker:
         Handles client disconnections and retries polling after a delay.
         """
         await asyncio.sleep(5) # Initial delay before first polling cycle
-        tui.tui_print_info(
-            f"Starting periodic user status polling every "
-            f"{USER_STATUS_POLL_INTERVAL_SECONDS} seconds."
+        logger.info(
+            "Starting periodic user status polling every %s seconds.",
+            USER_STATUS_POLL_INTERVAL_SECONDS,
         )
 
         while not self._shutdown_is_set() and self.is_running:
             assert self.client is not None, "Client must be initialized for polling."
             if not self.client.is_connected():
-                tui.tui_print_warning("Polling: Client not connected. Waiting for reconnection.")
+                logger.warning("Polling: Client not connected. Waiting for reconnection.")
                 try:
                     # Wait for shutdown signal or timeout, tolerant if event is not created yet
                     signaled = await self._shutdown_wait(float(USER_STATUS_POLL_INTERVAL_SECONDS))
                     if signaled:
                         break
                 except asyncio.CancelledError:
-                    tui.tui_print_info("Polling task cancelled during client disconnected wait.")
+                    logger.info("Polling task cancelled during client disconnected wait.")
                     break
                 continue # Retry connection check
 
             if not self.user_id_map:
-                tui.tui_print_debug("Polling: No resolved users to poll. Will check again later.")
+                logger.debug("Polling: No resolved users to poll. Will check again later.")
                 try:
                     signaled = await self._shutdown_wait(float(USER_STATUS_POLL_INTERVAL_SECONDS))
                     if signaled:
                         break
                 except asyncio.CancelledError:
-                    tui.tui_print_info("Polling task cancelled during no users wait.")
+                    logger.info("Polling task cancelled during no users wait.")
                     break
                 continue
 
-            tui.tui_print_info(
-                f"Polling run: Checking status for {len(self.user_id_map)} users: "
-                f"{list(self.user_id_map.values())[:5]}..."
+            logger.info(
+                "Polling run: Checking status for %s users: %s...",
+                len(self.user_id_map),
+                list(self.user_id_map.values())[:5],
             )
             # Iterate over a copy in case the map is modified (e.g., user deactivated)
             for user_id, username in list(self.user_id_map.items()): 
                 if self.shutdown_event.is_set(): break
                 try:
-                    tui.tui_print_debug(f"Polling: Requesting entity for {username} (ID: {user_id})")
+                    logger.debug(
+                        "Polling: Requesting entity for %s (ID: %s)", username, user_id
+                    )
                     entity: User = await self.client.get_entity(user_id) # type: ignore
                     
                     if entity and hasattr(entity, 'status'):
-                        tui.tui_print_debug(
-                            f"Polling: Entity for {username}, status: {type(entity.status).__name__}"
+                        logger.debug(
+                            "Polling: Entity for %s, status: %s",
+                            username,
+                            type(entity.status).__name__,
                         )
                         await self._process_status_update(
                             username, user_id, entity.status, source="polling"
                         )
                     elif entity: # Entity found but no status attribute
-                         tui.tui_print_warning(
-                            f"Polling: Entity for {username} lacks 'status' attribute. "
-                            f"Entity: {entity!r}. Treating as offline."
+                        logger.warning(
+                            "Polling: Entity for %s lacks 'status' attribute. Entity: %r. Treating as offline.",
+                            username,
+                            entity,
                         )
-                         await self._process_status_update(
+                        await self._process_status_update(
                             username, user_id, None, source="polling_no_status_attr"
                         )
                     else: # No entity found
-                        tui.tui_print_warning(
-                            f"Polling: Could not get entity for {username} (ID: {user_id}). "
-                            "Treating as offline."
+                        logger.warning(
+                            "Polling: Could not get entity for %s (ID: %s). Treating as offline.",
+                            username,
+                            user_id,
                         )
                         await self._process_status_update(
                             username, user_id, None, source="polling_no_entity"
@@ -583,7 +640,7 @@ class CorrelationTracker:
                 except (errors.RPCError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e_net_poll:
                     logger.error(f"Polling: Network/RPC error for {username}: {e_net_poll}. Will retry next cycle.")
                 except asyncio.CancelledError:
-                    tui.tui_print_info(f"Polling for user {username} cancelled.")
+                    logger.info("Polling for user %s cancelled.", username)
                     break # Exit user loop
                 except Exception as e_poll_user:
                     logger.error(f"Polling: Unexpected error for {username}: {e_poll_user}", exc_info=True)
@@ -595,8 +652,9 @@ class CorrelationTracker:
             
             if self._shutdown_is_set(): break # Exit main while loop
 
-            tui.tui_print_debug(
-                f"Polling cycle complete. Waiting {USER_STATUS_POLL_INTERVAL_SECONDS}s for next run."
+            logger.debug(
+                "Polling cycle complete. Waiting %s s for next run.",
+                USER_STATUS_POLL_INTERVAL_SECONDS,
             )
             try:
                 signaled = await self._shutdown_wait(float(USER_STATUS_POLL_INTERVAL_SECONDS))
@@ -605,9 +663,9 @@ class CorrelationTracker:
             except asyncio.TimeoutError:
                 pass # Expected timeout, continue polling
             except asyncio.CancelledError:
-                tui.tui_print_info("Polling task cancelled during main sleep.")
+                logger.info("Polling task cancelled during main sleep.")
                 break
-        tui.tui_print_info("Periodic user status polling task finished.")
+        logger.info("Periodic user status polling task finished.")
 
 
     def get_activity_data(self) -> pd.DataFrame:
@@ -623,13 +681,13 @@ class CorrelationTracker:
             logger.warning("No target users specified for CorrelationTracker. Returning empty DataFrame.")
             return pd.DataFrame()
 
-        tui.tui_print_debug(f"Fetching activity data for usernames: {self.target_usernames}")
+        logger.debug("Fetching activity data for usernames: %s", self.target_usernames)
         raw_activity: List[Tuple[str, int, bool]] = self.db.get_all_activity_for_users(
             self.target_usernames
         )
 
         if not raw_activity:
-            tui.tui_print_info(f"No activity found in DB for users: {self.target_usernames}")
+            logger.info("No activity found in DB for users: %s", self.target_usernames)
             # Create an empty DataFrame with correct structure
             empty_df = pd.DataFrame(columns=["timestamp"] + self.target_usernames)
             empty_df["timestamp"] = pd.to_datetime(empty_df["timestamp"], utc=True)
@@ -664,7 +722,7 @@ class CorrelationTracker:
         user updates. The method will run until `stop_tracking` is called or an
         uncaught critical error occurs.
         """
-        tui.tui_starting_process("Correlation Tracker")
+        logger.info("Starting Correlation Tracker")
         self.is_running = True
         # Create shutdown event bound to the current running loop if not yet created
         if self.shutdown_event is None:
@@ -675,7 +733,7 @@ class CorrelationTracker:
         while self.is_running and not self.shutdown_event.is_set():
             try:
                 await self._ensure_client_connected()
-                tui.tui_print_success("Telegram client connected and authorized.")
+                logger.info("Telegram client connected and authorized.")
                 assert self.client is not None, "Client must be available after _ensure_client_connected"
                 
                 await self._resolve_target_user_ids()
@@ -686,19 +744,21 @@ class CorrelationTracker:
                         "Event listener will be active."
                     )
                 elif self.polling_task is None or self.polling_task.done():
-                    tui.tui_print_info("Starting user status polling task...")
+                    logger.info("Starting user status polling task...")
                     self.polling_task = asyncio.create_task(self._poll_user_statuses())
                 else:
-                    tui.tui_print_info("Polling task already running or scheduled.")
+                    logger.info("Polling task already running or scheduled.")
 
                 if not self._handler_registered:
                     self.client.add_event_handler(self._handle_user_update, events.UserUpdate)
                     self._handler_registered = True
-                    tui.tui_print_info("Event handler added for user status updates.")
+                    logger.info("Event handler added for user status updates.")
                 users_being_tracked_str = f"{list(self.user_id_map.values())[:5]}..." if len(self.user_id_map) > 5 else list(self.user_id_map.values())
-                tui.tui_print_info(
-                    f"Entering main event loop. Client connected: {self.client.is_connected()}. "
-                    f"Tracking {len(self.user_id_map)} users: {users_being_tracked_str}"
+                logger.info(
+                    "Entering main event loop. Client connected: %s. Tracking %s users: %s",
+                    self.client.is_connected(),
+                    len(self.user_id_map),
+                    users_being_tracked_str,
                 )
                 
                 loop_counter = 0
@@ -707,12 +767,12 @@ class CorrelationTracker:
                         await asyncio.sleep(1) # Keep event loop responsive
                         loop_counter = (loop_counter + 1) % 300 # Reset every 5 mins
                         if loop_counter == 0:
-                           tui.tui_print_debug(
-                               f"Main event loop alive. Client connected. "
-                               f"Tracking {len(self.user_id_map)} active users."
+                           logger.debug(
+                               "Main event loop alive. Client connected. Tracking %s active users.",
+                               len(self.user_id_map),
                            )
                     except asyncio.CancelledError:
-                        tui.tui_print_info("Main event loop sleep cancelled.")
+                        logger.info("Main event loop sleep cancelled.")
                         self.is_running = False # Trigger exit from outer while
                         break
                 
@@ -737,7 +797,7 @@ class CorrelationTracker:
                 try: await asyncio.sleep(15) # Wait before outer loop retries
                 except asyncio.CancelledError: self.is_running = False
             except asyncio.CancelledError:
-                tui.tui_print_info("Tracker's start_tracking task was cancelled.")
+                logger.info("Tracker's start_tracking task was cancelled.")
                 self.is_running = False
             except Exception as e_start:
                 logger.error(f"Unexpected error in start_tracking: {e_start}", exc_info=True)
@@ -746,7 +806,7 @@ class CorrelationTracker:
             
             if not self.is_running: break # Exit outer while loop if error handlers set is_running=False
         
-        tui.tui_process_complete("Tracker main loop and initial setup ended.")
+        logger.info("Tracker main loop and initial setup ended.")
         await self.stop_tracking() # Ensure cleanup if loop exited
 
 
@@ -757,19 +817,19 @@ class CorrelationTracker:
         Signals all running tasks to shut down, cancels the polling task,
         disconnects the Telegram client, and closes the database connection.
         """
-        tui.tui_print_info("Initiating shutdown of tracker components...")
+        logger.info("Initiating shutdown of tracker components...")
         self.is_running = False 
         if self.shutdown_event is not None:
             self.shutdown_event.set()
 
         if self.polling_task and not self.polling_task.done():
-            tui.tui_print_info("Attempting to cancel polling task...")
+            logger.info("Attempting to cancel polling task...")
             self.polling_task.cancel()
             try:
                 await self.polling_task
-                tui.tui_print_info("Polling task finished after cancellation.")
+                logger.info("Polling task finished after cancellation.")
             except asyncio.CancelledError:
-                tui.tui_print_info("Polling task was cancelled successfully.")
+                logger.info("Polling task was cancelled successfully.")
             except Exception as e_poll_stop:
                 logger.error(f"Error during polling task shutdown: {e_poll_stop}", exc_info=True)
         
@@ -783,20 +843,20 @@ class CorrelationTracker:
                  logger.debug(f"Could not remove event handler (already removed or client issue): {e_remove_handler}")
             
             if self.client.is_connected():
-                tui.tui_print_info("Disconnecting Telegram client...")
+                logger.info("Disconnecting Telegram client...")
                 try:
                     await self.client.disconnect()
-                    tui.tui_print_success("Telegram client disconnected.")
+                    logger.info("Telegram client disconnected.")
                 except Exception as e_disc:
                     logger.error(f"Error disconnecting client: {e_disc}", exc_info=True)
-            self.client = None # Clear client reference
+                self.client = None # Clear client reference
         
         if self.db:
-            tui.tui_print_info("Closing database connection...")
+            logger.info("Closing database connection...")
             self.db.close()
-            tui.tui_print_success("Database connection closed.")
+            logger.info("Database connection closed.")
         
-        tui.tui_process_complete("Tracker shutdown sequence")
+        logger.info("Tracker shutdown sequence complete")
 
     # ---- Internal helpers for shutdown handling ----
     def _shutdown_is_set(self) -> bool:
@@ -888,7 +948,7 @@ async def _shutdown_wait(self, timeout: float) -> bool:
 # --- Script Execution (`if __name__ == '__main__':`) ---
 
 if __name__ == "__main__":
-    tui.tui_print_highlight("Running CorrelationTracker module directly (__main__)...")
+    logger.info("Running CorrelationTracker module directly (__main__)...")
     
     # Configure TUI logger level if desired for standalone run, e.g., for more verbose debug:
     # import logging as std_logging
@@ -926,9 +986,9 @@ if __name__ == "__main__":
                     logger.error(f"Exception during final cancellation of main task: {e_final_cancel}")
             
             if main_event_loop.is_running():
-                 tui.tui_print_info("Closing __main__ event loop.")
+                 logger.info("Closing __main__ event loop.")
                  main_event_loop.close()
-            tui.tui_process_complete("Tracker (__main__ execution finished)")
+            logger.info("Tracker (__main__ execution finished)")
     else:
         logger.error(
             "TARGET_USERS not set in .env or environment. "
